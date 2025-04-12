@@ -82,4 +82,49 @@ function getSettings() {
   return settings;
 }
 
-export { createSettingsForm, getSettings };
+async function saveSettingsToBackend(settings) {
+  try {
+    const response = await fetch('http://localhost:3000/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings)
+    });
+    if (!response.ok) throw new Error(`Failed to save settings: ${response.status}`);
+    return true;
+  } catch (error) {
+    console.error('Error saving settings:', error);
+    return false;
+  }
+}
+
+async function loadSettingsFromBackend() {
+  try {
+    const response = await fetch('http://localhost:3000/api/settings');
+    if (!response.ok) throw new Error(`Failed to load settings: ${response.status}`);
+    const settings = await response.json();
+    if (settingsForm) {
+      const inputs = settingsForm.querySelectorAll('input, select');
+      inputs.forEach(input => {
+        if (input.id in settings) {
+          if (input.type === 'checkbox') {
+            input.checked = settings[input.id];
+          } else if (['fallbackModels', 'providerOrder', 'ignoreProviders', 'quantizations', 'stop'].includes(input.id)) {
+            input.value = settings[input.id].join(', ');
+          } else if (input.id === 'maxPricePrompt' || input.id === 'maxPriceCompletion') {
+            input.value = settings.maxPrice?.[input.id === 'maxPricePrompt' ? 'prompt' : 'completion'] || '';
+          } else if (input.id === 'responseFormat') {
+            input.value = settings[input.id]?.type || '';
+          } else {
+            input.value = settings[input.id];
+          }
+        }
+      });
+    }
+    return settings;
+  } catch (error) {
+    console.error('Error loading settings:', error);
+    return null;
+  }
+}
+
+export { createSettingsForm, getSettings, saveSettingsToBackend, loadSettingsFromBackend };

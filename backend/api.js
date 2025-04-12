@@ -1,4 +1,8 @@
-let apiKey = '';
+import dotenv from "dotenv";
+
+dotenv.config();
+
+let apiKey = process.env.OPENROUTER_API_KEY || '';
 
 async function fetchModels() {
   if (!apiKey) return [];
@@ -64,7 +68,7 @@ async function sendMessageToAPI(messages, options = {}) {
   const controller = new AbortController();
   const headers = {
     'Authorization': `Bearer ${apiKey}`,
-    'HTTP-Referer': 'https://DamionR.github.io/chatbot-project/',
+    'HTTP-Referer': 'http://localhost:7777/chatbot-project/',
     'X-Title': 'Chatbot Project',
     'Content-Type': 'application/json'
   };

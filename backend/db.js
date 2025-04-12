@@ -1,8 +1,10 @@
+import { saveChat as saveChatToAPI, getChats as getChatsFromAPI } from "./api.js";
+
 const DB_NAME = 'chatbotDB';
 const DB_VERSION = 2;
 let db;
 
-function openDB() {
+async function openDB() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onerror = (event) => reject(event.target.error);
@@ -28,6 +30,7 @@ function openDB() {
 async function saveSetting(key, value, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      if (!db) await openDB();
       const transaction = db.transaction(['settings'], 'readwrite');
       const store = transaction.objectStore('settings');
       const request = store.put({ key, value });
@@ -46,6 +49,7 @@ async function saveSetting(key, value, retries = 3) {
 async function getSetting(key, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      if (!db) await openDB();
       const transaction = db.transaction(['settings'], 'readonly');
       const store = transaction.objectStore('settings');
       const request = store.get(key);
@@ -64,6 +68,7 @@ async function getSetting(key, retries = 3) {
 async function saveChat(chat, sessionId, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      if (!db) await openDB();
       const transaction = db.transaction(['chats'], 'readwrite');
       const store = transaction.objectStore('chats');
       const request = store.add({ ...chat, sessionId, timestamp: Date.now() });
@@ -71,6 +76,8 @@ async function saveChat(chat, sessionId, retries = 3) {
         request.onsuccess = () => resolve();
         request.onerror = (event) => reject(event.target.error);
       });
+      // Sync with external API
+      await saveChatToAPI({ ...chat, sessionId });
       return;
     } catch (error) {
       if (attempt === retries) throw new Error(`Failed to save chat after ${retries} attempts: ${error.message}`);
@@ -82,14 +89,23 @@ async function saveChat(chat, sessionId, retries = 3) {
 async function getChats(sessionId, limit = 50, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      if (!db) await openDB();
       const transaction = db.transaction(['chats'], 'readonly');
       const store = transaction.objectStore('chats');
       const index = store.index('sessionId');
       const request = index.getAll(IDBKeyRange.only(sessionId));
-      const chats = await new Promise((resolve, reject) => {
+      let chats = await new Promise((resolve, reject) => {
         request.onsuccess = () => resolve(request.result);
         request.onerror = (event) => reject(event.target.error);
       });
+      // Fetch from external API if local is empty
+      if (!chats.length) {
+        chats = await getChatsFromAPI(sessionId, limit);
+        // Cache API results locally
+        for (const chat of chats) {
+          await saveChat(chat, sessionId);
+        }
+      }
       return chats.sort((a, b) => b.timestamp - a.timestamp).slice(0, limit);
     } catch (error) {
       if (attempt === retries) throw new Error(`Failed to get chats after ${retries} attempts: ${error.message}`);
@@ -101,6 +117,7 @@ async function getChats(sessionId, limit = 50, retries = 3) {
 async function cleanupChats(maxAgeDays = 30, retries = 3) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
+      if (!db) await openDB();
       const transaction = db.transaction(['chats'], 'readwrite');
       const store = transaction.objectStore('chats');
       const index = store.index('timestamp');
@@ -126,5 +143,3 @@ async function cleanupChats(maxAgeDays = 30, retries = 3) {
     }
   }
 }
-
-export { openDB, saveSetting, getSetting, saveChat, getChats, cleanupChats };

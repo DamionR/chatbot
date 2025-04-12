@@ -1,6 +1,6 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { saveChat, getChats } from '../backend/db.js';
+import { saveChat, getChats } from '../../backend/db.js';
 
 const server = new McpServer({ name: "Chatstore", version: "1.0.0" });
 

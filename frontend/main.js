@@ -1,6 +1,6 @@
-import { openDB, saveSetting, getSetting, saveChat, getChats, cleanupChats } from './backend/db.js';
-import { fetchModels, sendMessageToAPI, checkCredits } from './backend/api.js';
-import { createSettingsForm, getSettings } from './config/settings.js';
+import { openDB, saveSetting, getSetting, saveChat, getChats, cleanupChats } from '../backend/db.js';
+import { fetchModels, sendMessageToAPI, checkCredits } from '../backend/api.js';
+import { createSettingsForm, getSettings, saveSettingsToBackend, loadSettingsFromBackend } from './config/settings.js';
 import { addMessageToHistory, processStream } from './utils/utils.js';
 import { createUI, setTheme, showView, chatHistory, inputField, apiKeyInput, modelSelect, themeToggle } from './ui.js';
 
@@ -8,7 +8,7 @@ let streamController = null;
 let apiKey = '';
 let orchestrator = null;
 let sessionId = null;
-const BACKEND_URL = 'https://your-backend-service.com:7777'; // Update with actual backend
+const BACKEND_URL = 'http://localhost:3000';
 
 async function init() {
   await openDB();
@@ -21,13 +21,14 @@ async function init() {
   themeToggle.checked = theme === 'dark';
   apiKeyInput.value = apiKey;
   createSettingsForm();
+  await loadSettingsFromBackend();
   if (apiKey) {
     await populateModels();
   } else {
-    addMessageToHistory('system', 'Please enter your API key in settings.');
+    await addMessageToHistory('system', 'Please enter your API key in settings.', sessionId);
   }
   const chats = await getChats(sessionId);
-  chats.forEach(chat => addMessageToHistory(chat.role, chat.content));
+  chats.forEach(chat => addMessageToHistory(chat.role, chat.content, sessionId));
   showView('chat');
 
   const Orchestrator = (await import('./agents/orchestrator.js')).default;
@@ -36,6 +37,19 @@ async function init() {
   console.log('Orchestrator initialized');
 
   setInterval(() => cleanupChats(30).catch(e => console.error('Cleanup failed:', e)), 24 * 60 * 60 * 1000);
+
+  // Event listeners for UI interactions
+  document.addEventListener('sendMessage', async (e) => {
+    await sendMessage(e.detail.cancelButton);
+  });
+  document.addEventListener('cancelStream', cancelStream);
+  document.addEventListener('apiKeyUpdated', async () => {
+    apiKey = apiKeyInput.value.trim();
+    await populateModels();
+  });
+  document.addEventListener('populateModels', async () => {
+    await populateModels();
+  });
 }
 
 function generateSessionId() {
@@ -43,54 +57,65 @@ function generateSessionId() {
 }
 
 async function populateModels() {
-  const models = await fetchModels();
-  modelSelect.innerHTML = '';
-  models.forEach(m => {
-    const opt = document.createElement('option');
-    opt.value = m.id;
-    opt.textContent = m.name || m.id;
-    modelSelect.appendChild(opt);
-  });
-  const savedModel = await getSetting('selectedModel');
-  if (savedModel && models.some(m => m.id === savedModel)) {
-    modelSelect.value = savedModel;
-  } else if (models.length) {
-    modelSelect.value = models[0].id;
-    await saveSetting('selectedModel', models[0].id);
+  try {
+    const models = await fetchModels();
+    modelSelect.innerHTML = '';
+    models.forEach(m => {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = m.name || m.id;
+      modelSelect.appendChild(opt);
+    });
+    const savedModel = await getSetting('selectedModel');
+    if (savedModel && models.some(m => m.id === savedModel)) {
+      modelSelect.value = savedModel;
+    } else if (models.length) {
+      modelSelect.value = models[0].id;
+      await saveSetting('selectedModel', models[0].id);
+    }
+    modelSelect.onchange = async () => {
+      await saveSetting('selectedModel', modelSelect.value);
+    };
+  } catch (error) {
+    console.error('Error populating models:', error);
+    await addMessageToHistory('system', `Error loading models: ${error.message}`, sessionId);
   }
-  modelSelect.onchange = () => saveSetting('selectedModel', modelSelect.value);
 }
 
 async function sendMessage(cancelButton) {
   const text = inputField.value.trim();
   if (!text) return;
-  addMessageToHistory('user', text);
-  await saveChat({ role: 'user', content: text }, sessionId);
-  inputField.value = '';
-  if (!apiKey || !modelSelect.value) {
-    addMessageToHistory('system', 'Please set API key and select a model in settings.');
-    return;
-  }
-
-  const typingMsg = document.createElement('div');
-  typingMsg.className = 'system-message';
-  typingMsg.textContent = 'Bot is typing...';
-  chatHistory.appendChild(typingMsg);
 
   try {
+    await addMessageToHistory('user', text, sessionId);
+    await saveChat({ role: 'user', content: text }, sessionId);
+    inputField.value = '';
+
+    if (!apiKey || !modelSelect.value) {
+      await addMessageToHistory('system', 'Please set API key and select a model in settings.', sessionId);
+      return;
+    }
+
+    const typingMsg = document.createElement('div');
+    typingMsg.className = 'system-message';
+    typingMsg.textContent = 'Bot is typing...';
+    chatHistory.appendChild(typingMsg);
+
     const chats = await getChats(sessionId);
     const messages = chats.map(chat => ({ role: chat.role, content: chat.content }));
     messages.push({ role: 'user', content: text });
 
     const lowerText = text.toLowerCase();
-    const agentKeywords = ["calculate", "translate", "email", "file", "news", "whois", "history", "fetch", "http"];
+    const agentKeywords = ["calculate", "translate", "email", "news", "whois", "history", "fetch", "http", "issue"];
     if (agentKeywords.some(keyword => lowerText.includes(keyword))) {
-      await orchestrator.handleMessage(text, sessionId, (response) => {
+      await orchestrator.handleMessage(text, sessionId, async (response) => {
         chatHistory.removeChild(typingMsg);
         if (response.includes("Error:")) {
-          addMessageToHistory('system', response);
+          await addMessageToHistory('system', response, sessionId);
+          await saveChat({ role: 'system', content: response }, sessionId);
         } else {
-          addMessageToHistory('assistant', response);
+          await addMessageToHistory('assistant', response, sessionId);
+          await saveChat({ role: 'assistant', content: response }, sessionId);
         }
       });
       return;
@@ -130,6 +155,7 @@ async function sendMessage(cancelButton) {
       throw new Error('Insufficient credits. Please add more credits.');
     }
 
+    await saveSettingsToBackend(settings);
     const result = await sendMessageToAPI(messages, options);
     chatHistory.removeChild(typingMsg);
 
@@ -137,16 +163,15 @@ async function sendMessage(cancelButton) {
       cancelButton.style.display = 'inline';
       streamController = result.controller;
       const reply = await processStream(result.stream, result.controller, sessionId);
-      await saveChat({ role: 'assistant', content: reply }, sessionId);
       cancelButton.style.display = 'none';
     } else {
-      addMessageToHistory('assistant', result.content);
+      await addMessageToHistory('assistant', result.content, sessionId);
       await saveChat({ role: 'assistant', content: result.content }, sessionId);
     }
-  } catch (e) {
+  } catch (error) {
     chatHistory.removeChild(typingMsg);
-    addMessageToHistory('system', `Error: ${e.message}`);
-    await saveChat({ role: 'system', content: `Error: ${e.message}` }, sessionId);
+    await addMessageToHistory('system', `Error: ${error.message}`, sessionId);
+    await saveChat({ role: 'system', content: `Error: ${error.message}` }, sessionId);
   }
 }
 
@@ -154,9 +179,12 @@ function cancelStream() {
   if (streamController) {
     streamController.abort();
     streamController = null;
-    addMessageToHistory('system', 'Stream cancelled.');
+    addMessageToHistory('system', 'Stream cancelled.', sessionId);
     saveChat({ role: 'system', content: 'Stream cancelled.' }, sessionId);
   }
 }
 
-init().catch(console.error);
+init().catch(error => {
+  console.error('Initialization failed:', error);
+  addMessageToHistory('system', `Initialization error: ${error.message}`, sessionId);
+});

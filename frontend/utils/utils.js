@@ -15,24 +15,24 @@ export async function addMessageToHistory(role, content, sessionId, metadata = n
       metaDiv.textContent = `Metadata: ${JSON.stringify(metadata)}`;
       metaDiv.style.fontSize = '0.8em';
       metaDiv.style.opacity = '0.7';
-      chatHistory.appendChild(metaDiv);
+      document.getElementById('chat-history').appendChild(metaDiv);
     }
 
-    chatHistory.appendChild(msgDiv);
-    chatHistory.scrollTop = chatHistory.scrollHeight;
+    document.getElementById('chat-history').appendChild(msgDiv);
+    document.getElementById('chat-history').scrollTop = document.getElementById('chat-history').scrollHeight;
 
     if (sessionId) {
       await saveChat({ role, content: truncatedContent }, sessionId);
     } else {
-      console.warn('No sessionId provided, skipping database save');
+      throw new Error('No sessionId provided');
     }
   } catch (error) {
     console.error('Error adding message to history:', error);
     const errorDiv = document.createElement('div');
     errorDiv.className = 'system-message';
     errorDiv.textContent = `Error displaying message: ${error.message}`;
-    chatHistory.appendChild(errorDiv);
-    chatHistory.scrollTop = chatHistory.scrollHeight;
+    document.getElementById('chat-history').appendChild(errorDiv);
+    document.getElementById('chat-history').scrollTop = document.getElementById('chat-history').scrollHeight;
   }
 }
 
@@ -100,20 +100,23 @@ export async function processStream(stream, controller, sessionId, context = nul
             } catch (e) {
               attempt++;
               if (attempt === retries) {
-                console.error('Invalid JSON in stream after retries:', e);
-                await addMessageToHistory('system', `Stream error: Invalid JSON`, sessionId);
-              } else {
-                console.warn(`JSON parse attempt ${attempt}/${retries} failed: ${e.message}`);
-                await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+                throw new Error(`Invalid JSON in stream after ${retries} attempts: ${e.message}`);
               }
+              console.warn(`JSON parse attempt ${attempt}/${retries} failed: ${e.message}`);
+              await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
             }
           }
         }
       }
     }
+    await saveChat({ role: 'assistant', content: reply }, sessionId);
     return reply;
+  } catch (error) {
+    console.error('Stream processing error:', error);
+    await addMessageToHistory('system', `Error processing stream: ${error.message}`, sessionId);
+    throw error;
   } finally {
     reader.releaseLock();
-    controller?.abort();
+    if (controller) controller.abort();
   }
 }

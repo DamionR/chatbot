@@ -1,3 +1,5 @@
+import { saveSetting } from '../backend/db.js';
+
 let chatHistory, inputField, apiKeyInput, modelSelect, themeToggle, chatView, settingsView;
 const style = document.createElement('style');
 document.head.appendChild(style);
@@ -5,6 +7,7 @@ document.head.appendChild(style);
 function setTheme(theme) {
   document.body.className = theme;
   setStyles();
+  saveSetting('theme', theme).catch(e => console.error('Failed to save theme:', e));
 }
 
 function setStyles() {
@@ -34,6 +37,9 @@ function setStyles() {
       border: none;
       cursor: pointer;
     }
+    .nav-button:hover {
+      background-color: ${isDark ? '#666' : '#ccc'};
+    }
     .content-area {
       flex: 1;
       padding: 20px;
@@ -51,39 +57,62 @@ function setStyles() {
     }
     .input-area {
       display: flex;
+      gap: 10px;
     }
     .input-area input {
       flex: 1;
-      padding: 5px;
+      padding: 8px;
+      border: 1px solid ${isDark ? '#555' : '#ccc'};
+      background-color: ${isDark ? '#555' : 'white'};
+      color: ${isDark ? 'white' : 'black'};
     }
     .input-area button {
-      margin-left: 10px;
-      padding: 5px 10px;
+      padding: 8px 16px;
+      background-color: ${isDark ? '#007bff' : '#0056b3'};
+      color: white;
+      border: none;
+      cursor: pointer;
+    }
+    .input-area button:hover {
+      background-color: ${isDark ? '#0056b3' : '#003d80'};
     }
     .settings-form {
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 12px;
+      max-width: 400px;
+    }
+    .settings-form label {
+      font-weight: bold;
+    }
+    .settings-form input, .settings-form select {
+      padding: 6px;
+      border: 1px solid ${isDark ? '#555' : '#ccc'};
+      background-color: ${isDark ? '#555' : 'white'};
+      color: ${isDark ? 'white' : 'black'};
     }
     .user-message {
       text-align: right;
       background-color: ${isDark ? '#0056b3' : '#007bff'};
       color: white;
-      padding: 5px;
-      margin: 5px;
-      border-radius: 5px;
+      padding: 8px;
+      margin: 8px 8px 8px 40px;
+      border-radius: 8px;
     }
     .assistant-message {
       text-align: left;
       background-color: ${isDark ? '#555' : '#f0f0f0'};
-      padding: 5px;
-      margin: 5px;
-      border-radius: 5px;
+      color: ${isDark ? 'white' : 'black'};
+      padding: 8px;
+      margin: 8px 40px 8px 8px;
+      border-radius: 8px;
     }
     .system-message {
       text-align: center;
-      color: red;
+      color: ${isDark ? '#ff6666' : '#cc0000'};
       font-style: italic;
+      padding: 4px;
+      margin: 4px;
     }
     @media (max-width: 768px) {
       .main-container {
@@ -93,12 +122,24 @@ function setStyles() {
         width: 100%;
         display: flex;
         justify-content: space-around;
+        padding: 8px;
+      }
+      .nav-button {
+        padding: 8px;
+        margin-bottom: 0;
       }
       .content-area {
-        padding: 10px;
+        padding: 12px;
       }
       .chat-history {
         height: 60vh;
+      }
+      .input-area {
+        flex-direction: column;
+      }
+      .input-area button {
+        width: 100%;
+        margin-top: 8px;
       }
     }
   `;
@@ -130,11 +171,13 @@ function createUI() {
   chatView = document.createElement('div');
   chatView.className = 'chat-view';
   chatHistory = document.createElement('div');
+  chatHistory.id = 'chat-history';
   chatHistory.className = 'chat-history';
   const inputArea = document.createElement('div');
   inputArea.className = 'input-area';
   inputField = document.createElement('input');
   inputField.type = 'text';
+  inputField.placeholder = 'Type your message...';
   const sendButton = document.createElement('button');
   sendButton.textContent = 'Send';
   const cancelButton = document.createElement('button');
@@ -155,21 +198,26 @@ function createUI() {
   apiKeyLabel.textContent = 'API Key:';
   apiKeyInput = document.createElement('input');
   apiKeyInput.type = 'text';
-  apiKeyInput.onblur = () => {
-    apiKey = apiKeyInput.value;
-    saveSetting('apiKey', apiKey).then(populateModels);
+  apiKeyInput.placeholder = 'Enter your API key';
+  apiKeyInput.onblur = async () => {
+    const key = apiKeyInput.value.trim();
+    if (key) {
+      await saveSetting('apiKey', key);
+      // Trigger model population in main.js
+      document.dispatchEvent(new Event('apiKeyUpdated'));
+    }
   };
   const modelLabel = document.createElement('label');
-  modelLabel.textContent = 'Select Free Model:';
+  modelLabel.textContent = 'Select Model:';
   modelSelect = document.createElement('select');
   const themeLabel = document.createElement('label');
   themeLabel.textContent = 'Dark Mode:';
   themeToggle = document.createElement('input');
   themeToggle.type = 'checkbox';
-  themeToggle.onchange = () => {
+  themeToggle.onchange = async () => {
     const theme = themeToggle.checked ? 'dark' : 'light';
     setTheme(theme);
-    saveSetting('theme', theme);
+    await saveSetting('theme', theme);
   };
   settingsForm.appendChild(apiKeyLabel);
   settingsForm.appendChild(apiKeyInput);
@@ -180,12 +228,12 @@ function createUI() {
   settingsView.appendChild(settingsForm);
   contentArea.appendChild(settingsView);
 
-  sendButton.addEventListener('click', () => sendMessage(cancelButton));
-  cancelButton.addEventListener('click', () => cancelStream());
+  sendButton.addEventListener('click', () => document.dispatchEvent(new CustomEvent('sendMessage', { detail: { cancelButton } })));
+  cancelButton.addEventListener('click', () => document.dispatchEvent(new Event('cancelStream')));
   inputField.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') {
       e.preventDefault();
-      sendMessage(cancelButton);
+      document.dispatchEvent(new CustomEvent('sendMessage', { detail: { cancelButton } }));
     }
   });
 }
@@ -193,7 +241,9 @@ function createUI() {
 function showView(view) {
   chatView.style.display = view === 'chat' ? 'block' : 'none';
   settingsView.style.display = view === 'settings' ? 'block' : 'none';
-  if (view === 'settings') populateModels();
+  if (view === 'settings') {
+    document.dispatchEvent(new Event('populateModels'));
+  }
 }
 
 export { createUI, setTheme, showView, chatHistory, inputField, apiKeyInput, modelSelect, themeToggle };
