@@ -1,4 +1,4 @@
-```markdown
+
 # Chatbot Project
 
 This is a web-based chatbot built with **Node.js** and **Vite**, designed to run on **GitHub Pages**. It uses the **Model Context Protocol (MCP)** to enable conversational tasks such as calculations, translations, and web searches directly in the browser.
@@ -86,4 +86,3 @@ This project is under the **MIT License**. See the [LICENSE](LICENSE) file for d
 ## Contact
 
 For questions or feedback, open an issue on the [GitHub repository](https://github.com/DamionR/chatbot/issues).
-```
