@@ -7,7 +7,8 @@ export default defineConfig({
     outDir: '../dist',
     emptyOutDir: true,
     rollupOptions: {
-      external: ['dotenv', 'node-fetch', 'fs', 'nodemailer', 'whois-json']
+      external: ['dotenv', 'node-fetch', 'fs', 'nodemailer', 'whois-json'],
+      input: 'frontend/index.html'
     }
   },
   server: {
