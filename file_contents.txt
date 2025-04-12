@@ -1,0 +1,3250 @@
+
+=== /Users/damionrashford/chatbot-project/package.json ===
+{
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.9.0",
+    "@octokit/rest": "^21.1.1",
+    "fs": "^0.0.1-security",
+    "node-fetch": "^3.3.2",
+    "nodemailer": "^6.10.0",
+    "path": "^0.12.7",
+    "whois": "^2.14.2",
+    "zod": "^3.24.2"
+  }
+}
+
+
+=== /Users/damionrashford/chatbot-project/.env ===
+# .env file for configuring environment variables
+# Replace the placeholder values with your actual credentials and settings.
+
+# Database configuration
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=your_username
+DB_PASSWORD=your_password
+DB_NAME=your_database
+
+# API keys
+API_KEY=your_api_key
+STRIPE_API_KEY=your_stripe_key
+SENDGRID_API_KEY=your_sendgrid_key
+
+# Application settings
+NODE_ENV=development
+PORT=3000
+SECRET_KEY=your_secret_key
+
+# AWS credentials
+AWS_ACCESS_KEY_ID=your_aws_access_key
+AWS_SECRET_ACCESS_KEY=your_aws_secret_key
+
+# Redis configuration
+REDIS_URL=redis://localhost:6379
+
+=== /Users/damionrashford/chatbot-project/utils/utils.js ===
+// utils/utils.js
+async function addMessageToHistory(role, content, sessionId, metadata = null) {
+  try {
+    // Truncate content to prevent UI lag
+    const maxLength = 1000;
+    const truncatedContent = content.length > maxLength ? content.substring(0, maxLength) + '...' : content;
+
+    // Create message div
+    const msgDiv = document.createElement('div');
+    msgDiv.className = role === 'user' ? 'user-message' : role === 'assistant' ? 'assistant-message' : 'system-message';
+    msgDiv.textContent = truncatedContent;
+
+    // Append metadata if provided (e.g., agent re-routing info)
+    if (metadata) {
+      const metaDiv = document.createElement('div');
+      metaDiv.className = 'system-message';
+      metaDiv.textContent = `Metadata: ${JSON.stringify(metadata)}`;
+      metaDiv.style.fontSize = '0.8em';
+      metaDiv.style.opacity = '0.7';
+      chatHistory.appendChild(metaDiv);
+    }
+
+    chatHistory.appendChild(msgDiv);
+    chatHistory.scrollTop = chatHistory.scrollHeight;
+
+    // Save to database
+    if (sessionId) {
+      await saveChat({ role, content: truncatedContent }, sessionId);
+    } else {
+      console.warn('No sessionId provided, skipping database save');
+    }
+  } catch (error) {
+    console.error('Error adding message to history:', error);
+    const errorDiv = document.createElement('div');
+    errorDiv.className = 'system-message';
+    errorDiv.textContent = `Error displaying message: ${error.message}`;
+    chatHistory.appendChild(errorDiv);
+    chatHistory.scrollTop = chatHistory.scrollHeight;
+  }
+}
+
+async function processStream(stream, controller, sessionId, context = null, retries = 3) {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let reply = '';
+
+  try {
+    while (true) {
+      let attempt = 0;
+      let readResult = null;
+      while (attempt < retries) {
+        try {
+          readResult = await reader.read();
+          break;
+        } catch (error) {
+          attempt++;
+          if (attempt === retries) {
+            throw new Error(`Failed to read stream after ${retries} attempts: ${error.message}`);
+          }
+          console.warn(`Stream read attempt ${attempt}/${retries} failed: ${error.message}`);
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        }
+      }
+
+      const { done, value } = readResult;
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      while (true) {
+        const lineEnd = buffer.indexOf('\n');
+        if (lineEnd === -1) break;
+        const line = buffer.slice(0, lineEnd).trim();
+        buffer = buffer.slice(lineEnd + 1);
+
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6);
+          if (data === '[DONE]') break;
+
+          attempt = 0;
+          while (attempt < retries) {
+            try {
+              const parsed = JSON.parse(data);
+              const content = parsed.choices?.[0]?.delta?.content;
+              if (content) {
+                // Check context for relevance (e.g., skip unrelated chunks)
+                let shouldAppend = true;
+                if (context) {
+                  const contextData = JSON.parse(context);
+                  const lastChat = contextData[contextData.length - 1];
+                  if (lastChat?.content) {
+                    const queryWords = lastChat.content.toLowerCase().split(/\s+/);
+                    const contentWords = content.toLowerCase().split(/\s+/);
+                    shouldAppend = queryWords.some(q => contentWords.includes(q));
+                  }
+                }
+
+                if (shouldAppend) {
+                  reply += content;
+                  await addMessageToHistory('assistant', reply, sessionId);
+                }
+              }
+              break;
+            } catch (e) {
+              attempt++;
+              if (attempt === retries) {
+                console.error('Invalid JSON in stream after retries:', e);
+                await addMessageToHistory('system', `Stream error: Invalid JSON`, sessionId);
+              } else {
+                console.warn(`JSON parse attempt ${attempt}/${retries} failed: ${e.message}`);
+                await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+              }
+            }
+          }
+        }
+      }
+    }
+    return reply;
+  } finally {
+    reader.releaseLock();
+    controller?.abort();
+  }
+}
+
+=== /Users/damionrashford/chatbot-project/mcp/whois.js ===
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import whois from "whois";
+
+// Helper function to perform WHOIS lookup
+async function performWhoisLookup(query) {
+  return new Promise((resolve, reject) => {
+    whois.lookup(query, { timeout: 5000 }, (err, data) => {
+      if (err) reject(err);
+      else resolve(data);
+    });
+  });
+}
+
+const server = new McpServer({ name: "Whois", version: "1.0.0" });
+
+// **Tool: whois_domain** - Lookup WHOIS information for a domain
+server.tool(
+  "whois_domain",
+  { domain: z.string().describe("The domain name to look up (e.g., example.com)") },
+  async ({ domain }) => {
+    try {
+      const data = await performWhoisLookup(domain);
+      return { content: [{ type: "text", text: data }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: whois_tld** - Lookup WHOIS information for a TLD
+server.tool(
+  "whois_tld",
+  { tld: z.string().describe("The top-level domain to look up (e.g., .com)") },
+  async ({ tld }) => {
+    try {
+      const data = await performWhoisLookup(tld);
+      return { content: [{ type: "text", text: data }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: whois_ip** - Lookup WHOIS information for an IP address
+server.tool(
+  "whois_ip",
+  { ip: z.string().describe("The IP address to look up (e.g., 8.8.8.8)") },
+  async ({ ip }) => {
+    try {
+      const data = await performWhoisLookup(ip);
+      return { content: [{ type: "text", text: data }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: whois_as** - Lookup WHOIS information for an Autonomous System Number (ASN)
+server.tool(
+  "whois_as",
+  { asn: z.string().describe("The ASN to look up (e.g., AS15169)") },
+  async ({ asn }) => {
+    try {
+      const data = await performWhoisLookup(asn);
+      return { content: [{ type: "text", text: data }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// Start the server
+server.start();
+
+=== /Users/damionrashford/chatbot-project/mcp/websearch.js ===
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import fetch from "node-fetch";
+
+const API_URL = process.env.API_URL || "http://localhost:3001"; // Configure via environment variable
+
+const server = new McpServer({ name: "WebSearch", version: "1.0.0" });
+
+// **Tool: web_search** - Perform a web search
+server.tool(
+  "web_search",
+  {
+    query: z.string().describe("The search query"),
+    numResults: z.number().optional().default(5).describe("Number of results to return"),
+    language: z.string().optional().describe("Language code (e.g., 'en')"),
+    region: z.string().optional().describe("Region code (e.g., 'us')"),
+    excludeDomains: z.array(z.string()).optional().describe("Domains to exclude"),
+    includeDomains: z.array(z.string()).optional().describe("Domains to include"),
+    excludeTerms: z.array(z.string()).optional().describe("Terms to exclude"),
+    resultType: z
+      .enum(["all", "news", "blogs"])
+      .optional()
+      .describe("Type of results to return"),
+  },
+  async ({ query, numResults, language, region, excludeDomains, includeDomains, excludeTerms, resultType }) => {
+    try {
+      const response = await fetch(`${API_URL}/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query,
+          numResults,
+          language,
+          region,
+          excludeDomains,
+          includeDomains,
+          excludeTerms,
+          resultType,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status} - ${response.statusText}`);
+      }
+      const data = await response.json();
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// Start the server
+server.start();
+
+=== /Users/damionrashford/chatbot-project/mcp/tavily.js ===
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import fetch from "node-fetch";
+
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY; // Required environment variable
+
+const server = new McpServer({ name: "Tavily", version: "1.0.0" });
+
+if (!TAVILY_API_KEY) {
+  // **Tool: tavily_search** - Disabled if API key is missing
+  server.tool("tavily_search", {}, async () => {
+    return { content: [{ type: "text", text: "Error: TAVILY_API_KEY not set" }], isError: true };
+  });
+
+  // **Tool: tavily_extract** - Disabled if API key is missing
+  server.tool("tavily_extract", {}, async () => {
+    return { content: [{ type: "text", text: "Error: TAVILY_API_KEY not set" }], isError: true };
+  });
+} else {
+  // **Tool: tavily_search** - Perform a web search using Tavily
+  server.tool(
+    "tavily_search",
+    { query: z.string().describe("The search query") },
+    async ({ query }) => {
+      try {
+        const response = await fetch("https://api.tavily.com/search", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${TAVILY_API_KEY}`,
+          },
+          body: JSON.stringify({ query, api_key: TAVILY_API_KEY }),
+        });
+        if (!response.ok) {
+          throw new Error(`API error: ${response.status} - ${response.statusText}`);
+        }
+        const data = await response.json();
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: tavily_extract** - Extract content from a URL using Tavily
+  server.tool(
+    "tavily_extract",
+    { url: z.string().describe("The URL to extract content from") },
+    async ({ url }) => {
+      try {
+        const response = await fetch("https://api.tavily.com/extract", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${TAVILY_API_KEY}`,
+          },
+          body: JSON.stringify({ url, api_key: TAVILY_API_KEY }),
+        });
+        if (!response.ok) {
+          throw new Error(`API error: ${response.status} - ${response.statusText}`);
+        }
+        const data = await response.json();
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+}
+
+// Start the server
+server.start();
+
+=== /Users/damionrashford/chatbot-project/mcp/sequentialthinking.js ===
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+
+const server = new McpServer({ name: "SequentialThinking", version: "1.0.0" });
+
+// **Tool: sequential_thinking** - Process a thought in a sequence for problem-solving
+server.tool(
+  "sequential_thinking",
+  {
+    thought: z.string().describe("The current thought or step in the sequence"),
+    nextThoughtNeeded: z.boolean().describe("Whether another thought is required after this one"),
+    thoughtNumber: z.number().describe("The current thought's position in the sequence"),
+    totalThoughts: z.number().describe("The expected total number of thoughts"),
+    isRevision: z.boolean().optional().describe("Whether this revises a previous thought"),
+    revisesThought: z.number().optional().describe("The thought number being revised"),
+    branchFromThought: z.number().optional().describe("The thought number to branch from"),
+    branchId: z.string().optional().describe("Identifier for the branch, if branching"),
+    needsMoreThoughts: z
+      .boolean()
+      .optional()
+      .describe("Whether to dynamically increase totalThoughts"),
+  },
+  async ({
+    thought,
+    nextThoughtNeeded,
+    thoughtNumber,
+    totalThoughts,
+    isRevision,
+    revisesThought,
+    branchFromThought,
+    branchId,
+    needsMoreThoughts,
+  }) => {
+    try {
+      // Construct a response based on the parameters
+      const response = {
+        thought,
+        thoughtNumber,
+        totalThoughts: needsMoreThoughts ? totalThoughts + 1 : totalThoughts,
+        status: nextThoughtNeeded ? "Continue" : "Complete",
+      };
+      if (isRevision && revisesThought !== undefined) {
+        response.revision = `Revises thought #${revisesThought}`;
+      }
+      if (branchFromThought !== undefined) {
+        response.branch = `Branched from thought #${branchFromThought}${branchId ? ` (ID: ${branchId})` : ""}`;
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(response, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// Start the server
+server.start();
+
+=== /Users/damionrashford/chatbot-project/mcp/github.js ===
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { Octokit } from "@octokit/rest";
+
+const GITHUB_TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN; // Required environment variable
+
+const server = new McpServer({ name: "GitHub", version: "1.0.0" });
+
+if (!GITHUB_TOKEN) {
+  // Define all tools with an error if token is missing
+  const tools = [
+    "get_me",
+    "get_issue",
+    "get_issue_comments",
+    "create_issue",
+    "add_issue_comment",
+    "list_issues",
+    "update_issue",
+    "search_issues",
+    "get_pull_request",
+    "list_pull_requests",
+    "merge_pull_request",
+    "get_pull_request_files",
+    "get_pull_request_status",
+    "update_pull_request_branch",
+    "get_pull_request_comments",
+    "get_pull_request_reviews",
+    "create_pull_request_review",
+    "create_pull_request",
+    "update_pull_request",
+    "create_or_update_file",
+    "list_branches",
+    "push_files",
+    "search_repositories",
+    "create_repository",
+    "get_file_contents",
+    "fork_repository",
+    "create_branch",
+    "list_commits",
+    "get_commit",
+    "search_code",
+    "search_users",
+    "get_code_scanning_alert",
+    "list_code_scanning_alerts",
+  ];
+  tools.forEach(toolName => {
+    server.tool(toolName, {}, async () => {
+      return {
+        content: [{ type: "text", text: "Error: GITHUB_PERSONAL_ACCESS_TOKEN not set" }],
+        isError: true,
+      };
+    });
+  });
+} else {
+  const octokit = new Octokit({ auth: GITHUB_TOKEN });
+
+  // **Tool: get_me** - Get authenticated user details
+  server.tool("get_me", {}, async () => {
+    try {
+      const { data } = await octokit.users.getAuthenticated();
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  });
+
+  // **Tool: get_issue** - Get a specific issue
+  server.tool(
+    "get_issue",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      issue_number: z.number(),
+    },
+    async ({ owner, repo, issue_number }) => {
+      try {
+        const { data } = await octokit.issues.get({ owner, repo, issue_number });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: get_issue_comments** - Get comments on an issue
+  server.tool(
+    "get_issue_comments",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      issue_number: z.number(),
+    },
+    async ({ owner, repo, issue_number }) => {
+      try {
+        const { data } = await octokit.issues.listComments({ owner, repo, issue_number });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: create_issue** - Create a new issue
+  server.tool(
+    "create_issue",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      title: z.string(),
+      body: z.string().optional(),
+      assignees: z.array(z.string()).optional(),
+      labels: z.array(z.string()).optional(),
+    },
+    async ({ owner, repo, title, body, assignees, labels }) => {
+      try {
+        const { data } = await octokit.issues.create({ owner, repo, title, body, assignees, labels });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: add_issue_comment** - Add a comment to an issue
+  server.tool(
+    "add_issue_comment",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      issue_number: z.number(),
+      body: z.string(),
+    },
+    async ({ owner, repo, issue_number, body }) => {
+      try {
+        const { data } = await octokit.issues.createComment({ owner, repo, issue_number, body });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: list_issues** - List issues in a repository
+  server.tool(
+    "list_issues",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      state: z.enum(["open", "closed", "all"]).optional().default("open"),
+    },
+    async ({ owner, repo, state }) => {
+      try {
+        const { data } = await octokit.issues.listForRepo({ owner, repo, state });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: update_issue** - Update an existing issue
+  server.tool(
+    "update_issue",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      issue_number: z.number(),
+      title: z.string().optional(),
+      body: z.string().optional(),
+      state: z.enum(["open", "closed"]).optional(),
+    },
+    async ({ owner, repo, issue_number, title, body, state }) => {
+      try {
+        const { data } = await octokit.issues.update({ owner, repo, issue_number, title, body, state });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: search_issues** - Search for issues across GitHub
+  server.tool(
+    "search_issues",
+    { query: z.string() },
+    async ({ query }) => {
+      try {
+        const { data } = await octokit.search.issuesAndPullRequests({ q: query });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: get_pull_request** - Get a specific pull request
+  server.tool(
+    "get_pull_request",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      pull_number: z.number(),
+    },
+    async ({ owner, repo, pull_number }) => {
+      try {
+        const { data } = await octokit.pulls.get({ owner, repo, pull_number });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: list_pull_requests** - List pull requests in a repository
+  server.tool(
+    "list_pull_requests",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      state: z.enum(["open", "closed", "all"]).optional().default("open"),
+    },
+    async ({ owner, repo, state }) => {
+      try {
+        const { data } = await octokit.pulls.list({ owner, repo, state });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: merge_pull_request** - Merge a pull request
+  server.tool(
+    "merge_pull_request",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      pull_number: z.number(),
+      commit_message: z.string().optional(),
+    },
+    async ({ owner, repo, pull_number, commit_message }) => {
+      try {
+        const { data } = await octokit.pulls.merge({ owner, repo, pull_number, commit_message });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: get_pull_request_files** - Get files in a pull request
+  server.tool(
+    "get_pull_request_files",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      pull_number: z.number(),
+    },
+    async ({ owner, repo, pull_number }) => {
+      try {
+        const { data } = await octokit.pulls.listFiles({ owner, repo, pull_number });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: get_pull_request_status** - Get the status of a pull request (simplified)
+  server.tool(
+    "get_pull_request_status",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      pull_number: z.number(),
+    },
+    async ({ owner, repo, pull_number }) => {
+      try {
+        const { data } = await octokit.pulls.get({ owner, repo, pull_number });
+        return { content: [{ type: "text", text: JSON.stringify({ state: data.state }, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: update_pull_request_branch** - Update the branch of a pull request
+  server.tool(
+    "update_pull_request_branch",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      pull_number: z.number(),
+    },
+    async ({ owner, repo, pull_number }) => {
+      try {
+        const { data } = await octokit.pulls.updateBranch({ owner, repo, pull_number });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: get_pull_request_comments** - Get comments on a pull request
+  server.tool(
+    "get_pull_request_comments",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      pull_number: z.number(),
+    },
+    async ({ owner, repo, pull_number }) => {
+      try {
+        const { data } = await octokit.pulls.listComments({ owner, repo, pull_number });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: get_pull_request_reviews** - Get reviews on a pull request
+  server.tool(
+    "get_pull_request_reviews",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      pull_number: z.number(),
+    },
+    async ({ owner, repo, pull_number }) => {
+      try {
+        const { data } = await octokit.pulls.listReviews({ owner, repo, pull_number });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: create_pull_request_review** - Submit a review on a pull request
+  server.tool(
+    "create_pull_request_review",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      pull_number: z.number(),
+      body: z.string(),
+      event: z.enum(["APPROVE", "REQUEST_CHANGES", "COMMENT"]),
+    },
+    async ({ owner, repo, pull_number, body, event }) => {
+      try {
+        const { data } = await octokit.pulls.createReview({ owner, repo, pull_number, body, event });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: create_pull_request** - Create a new pull request
+  server.tool(
+    "create_pull_request",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      title: z.string(),
+      head: z.string(),
+      base: z.string(),
+      body: z.string().optional(),
+    },
+    async ({ owner, repo, title, head, base, body }) => {
+      try {
+        const { data } = await octokit.pulls.create({ owner, repo, title, head, base, body });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: update_pull_request** - Update an existing pull request
+  server.tool(
+    "update_pull_request",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      pull_number: z.number(),
+      title: z.string().optional(),
+      body: z.string().optional(),
+      state: z.enum(["open", "closed"]).optional(),
+    },
+    async ({ owner, repo, pull_number, title, body, state }) => {
+      try {
+        const { data } = await octokit.pulls.update({ owner, repo, pull_number, title, body, state });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: create_or_update_file** - Create or update a file in a repository
+  server.tool(
+    "create_or_update_file",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      path: z.string(),
+      content: z.string(),
+      message: z.string(),
+      branch: z.string().optional(),
+    },
+    async ({ owner, repo, path: filePath, content, message, branch }) => {
+      try {
+        const { data: existing } = await octokit.repos.getContent({ owner, repo, path: filePath }).catch(() => ({}));
+        const sha = existing.sha;
+        const { data } = await octokit.repos.createOrUpdateFileContents({
+          owner,
+          repo,
+          path: filePath,
+          message,
+          content: Buffer.from(content).toString("base64"),
+          sha,
+          branch,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: list_branches** - List branches in a repository
+  server.tool(
+    "list_branches",
+    {
+      owner: z.string(),
+      repo: z.string(),
+    },
+    async ({ owner, repo }) => {
+      try {
+        const { data } = await octokit.repos.listBranches({ owner, repo });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: push_files** - Simplified placeholder for pushing multiple files
+  server.tool(
+    "push_files",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      files: z.array(z.object({ path: z.string(), content: z.string() })),
+      message: z.string(),
+      branch: z.string().optional(),
+    },
+    async ({ owner, repo, files, message, branch }) => {
+      try {
+        for (const { path: filePath, content } of files) {
+          const { data: existing } = await octokit.repos.getContent({ owner, repo, path: filePath }).catch(() => ({}));
+          await octokit.repos.createOrUpdateFileContents({
+            owner,
+            repo,
+            path: filePath,
+            message,
+            content: Buffer.from(content).toString("base64"),
+            sha: existing.sha,
+            branch,
+          });
+        }
+        return { content: [{ type: "text", text: "Files pushed successfully" }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: search_repositories** - Search for repositories
+  server.tool(
+    "search_repositories",
+    { query: z.string() },
+    async ({ query }) => {
+      try {
+        const { data } = await octokit.search.repos({ q: query });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: create_repository** - Create a new repository
+  server.tool(
+    "create_repository",
+    {
+      name: z.string(),
+      description: z.string().optional(),
+      private: z.boolean().optional().default(false),
+    },
+    async ({ name, description, private: isPrivate }) => {
+      try {
+        const { data } = await octokit.repos.createForAuthenticatedUser({
+          name,
+          description,
+          private: isPrivate,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: get_file_contents** - Get file contents from a repository
+  server.tool(
+    "get_file_contents",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      path: z.string(),
+      ref: z.string().optional(),
+    },
+    async ({ owner, repo, path: filePath, ref }) => {
+      try {
+        const { data } = await octokit.repos.getContent({ owner, repo, path: filePath, ref });
+        const content = Buffer.from(data.content, "base64").toString("utf-8");
+        return { content: [{ type: "text", text: content }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: fork_repository** - Fork a repository
+  server.tool(
+    "fork_repository",
+    {
+      owner: z.string(),
+      repo: z.string(),
+    },
+    async ({ owner, repo }) => {
+      try {
+        const { data } = await octokit.repos.createFork({ owner, repo });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: create_branch** - Create a new branch
+  server.tool(
+    "create_branch",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      branch: z.string(),
+      sha: z.string(),
+    },
+    async ({ owner, repo, branch, sha }) => {
+      try {
+        const { data } = await octokit.git.createRef({
+          owner,
+          repo,
+          ref: `refs/heads/${branch}`,
+          sha,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: list_commits** - List commits in a repository
+  server.tool(
+    "list_commits",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      sha: z.string().optional(),
+    },
+    async ({ owner, repo, sha }) => {
+      try {
+        const { data } = await octokit.repos.listCommits({ owner, repo, sha });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: get_commit** - Get a specific commit
+  server.tool(
+    "get_commit",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      ref: z.string(),
+    },
+    async ({ owner, repo, ref }) => {
+      try {
+        const { data } = await octokit.git.getCommit({ owner, repo, commit_sha: ref });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: search_code** - Search code across GitHub
+  server.tool(
+    "search_code",
+    { query: z.string() },
+    async ({ query }) => {
+      try {
+        const { data } = await octokit.search.code({ q: query });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: search_users** - Search for users
+  server.tool(
+    "search_users",
+    { query: z.string() },
+    async ({ query }) => {
+      try {
+        const { data } = await octokit.search.users({ q: query });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: get_code_scanning_alert** - Get a specific code scanning alert
+  server.tool(
+    "get_code_scanning_alert",
+    {
+      owner: z.string(),
+      repo: z.string(),
+      alert_number: z.number(),
+    },
+    async ({ owner, repo, alert_number }) => {
+      try {
+        const { data } = await octokit.codeScanning.getAlert({ owner, repo, alert_number });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Tool: list_code_scanning_alerts** - List code scanning alerts
+  server.tool(
+    "list_code_scanning_alerts",
+    {
+      owner: z.string(),
+      repo: z.string(),
+    },
+    async ({ owner, repo }) => {
+      try {
+        const { data } = await octokit.codeScanning.listAlertsForRepo({ owner, repo });
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+
+  // **Resource: repo_content** - Get repository content
+  server.resource(
+    "repo_content",
+    new ResourceTemplate("repo://{owner}/{repo}/contents{/path*}", { list: undefined }),
+    async (uri, { owner, repo, path }) => {
+      try {
+        const { data } = await octokit.repos.getContent({
+          owner,
+          repo,
+          path: path || "",
+        });
+        if (Array.isArray(data)) {
+          return {
+            contents: data.map(item => ({
+              uri: `repo://${owner}/${repo}/contents/${item.path}`,
+              text: item.type === "file" ? "File" : "Directory",
+            })),
+          };
+        } else {
+          const content = Buffer.from(data.content, "base64").toString("utf-8");
+          return { contents: [{ uri: uri.href, text: content }] };
+        }
+      } catch (error) {
+        throw new Error(`Failed to get content: ${error.message}`);
+      }
+    }
+  );
+
+  // **Resource: repo_branch_content** - Get content from a specific branch
+  server.resource(
+    "repo_branch_content",
+    new ResourceTemplate("repo://{owner}/{repo}/refs/heads/{branch}/contents{/path*}", { list: undefined }),
+    async (uri, { owner, repo, branch, path }) => {
+      try {
+        const { data } = await octokit.repos.getContent({
+          owner,
+          repo,
+          path: path || "",
+          ref: branch,
+        });
+        if (Array.isArray(data)) {
+          return {
+            contents: data.map(item => ({
+              uri: `repo://${owner}/${repo}/refs/heads/${branch}/contents/${item.path}`,
+              text: item.type === "file" ? "File" : "Directory",
+            })),
+          };
+        } else {
+          const content = Buffer.from(data.content, "base64").toString("utf-8");
+          return { contents: [{ uri: uri.href, text: content }] };
+        }
+      } catch (error) {
+        throw new Error(`Failed to get branch content: ${error.message}`);
+      }
+    }
+  );
+}
+
+// Start the server
+server.start();
+
+=== /Users/damionrashford/chatbot-project/mcp/googlenews.js ===
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import fetch from "node-fetch";
+
+const SERP_API_KEY = process.env.SERP_API_KEY; // Required environment variable
+
+const server = new McpServer({ name: "GoogleNews", version: "1.0.0" });
+
+if (!SERP_API_KEY) {
+  // **Tool: google_news_search** - Disabled if API key is missing
+  server.tool("google_news_search", {}, async () => {
+    return { content: [{ type: "text", text: "Error: SERP_API_KEY not set" }], isError: true };
+  });
+} else {
+  // **Tool: google_news_search** - Search Google News
+  server.tool(
+    "google_news_search",
+    {
+      q: z.string().describe("The search query"),
+      gl: z.string().optional().describe("Country code (e.g., 'us')"),
+      hl: z.string().optional().describe("Language code (e.g., 'en')"),
+      topic_token: z.string().optional().describe("Google News topic token"),
+      publication_token: z.string().optional().describe("Publication token"),
+      story_token: z.string().optional().describe("Story token"),
+      section_token: z.string().optional().describe("Section token"),
+    },
+    async ({ q, gl, hl, topic_token, publication_token, story_token, section_token }) => {
+      try {
+        const params = new URLSearchParams({
+          engine: "google_news",
+          q,
+          ...(gl && { gl }),
+          ...(hl && { hl }),
+          ...(topic_token && { topic_token }),
+          ...(publication_token && { publication_token }),
+          ...(story_token && { story_token }),
+          ...(section_token && { section_token }),
+          api_key: SERP_API_KEY,
+        });
+        const response = await fetch(`https://serpapi.com/search?${params.toString()}`, {
+          method: "GET",
+        });
+        if (!response.ok) {
+          throw new Error(`API error: ${response.status} - ${response.statusText}`);
+        }
+        const data = await response.json();
+        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+      }
+    }
+  );
+}
+
+// Start the server
+server.start();
+
+=== /Users/damionrashford/chatbot-project/mcp/filesystem.js ===
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import fs from "fs/promises";
+import path from "path";
+
+// Define allowed directories via environment variable (comma-separated paths)
+const ALLOWED_DIRS = process.env.ALLOWED_DIRS
+  ? process.env.ALLOWED_DIRS.split(",").map(dir => path.resolve(dir))
+  : [path.resolve(process.cwd())]; // Default to current working directory if not set
+
+// Helper function to check if a path is within allowed directories
+function isPathAllowed(filePath) {
+  const absPath = path.resolve(filePath);
+  return ALLOWED_DIRS.some(dir => absPath.startsWith(dir + path.sep));
+}
+
+// Helper function to search files recursively (simple implementation)
+async function searchFiles(dirPath, pattern) {
+  const results = [];
+  const regex = new RegExp(pattern.replace(/\*/g, ".*"), "i"); // Convert glob-like pattern to regex
+  async function traverse(currentPath) {
+    const entries = await fs.readdir(currentPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(currentPath, entry.name);
+      if (entry.isDirectory()) {
+        await traverse(fullPath);
+      } else if (regex.test(entry.name)) {
+        results.push(fullPath);
+      }
+    }
+  }
+  await traverse(dirPath);
+  return results;
+}
+
+const server = new McpServer({ name: "Filesystem", version: "1.0.0" });
+
+// **Tool: read_file** - Read the complete contents of a file
+server.tool(
+  "read_file",
+  { path: z.string().describe("The path to the file to read") },
+  async ({ path: filePath }) => {
+    if (!isPathAllowed(filePath)) {
+      return { content: [{ type: "text", text: "Error: Access denied" }], isError: true };
+    }
+    try {
+      const content = await fs.readFile(filePath, "utf-8");
+      return { content: [{ type: "text", text: content }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: write_file** - Create a new file or overwrite an existing one
+server.tool(
+  "write_file",
+  {
+    path: z.string().describe("The path to the file to write"),
+    content: z.string().describe("The content to write to the file"),
+  },
+  async ({ path: filePath, content }) => {
+    if (!isPathAllowed(filePath)) {
+      return { content: [{ type: "text", text: "Error: Access denied" }], isError: true };
+    }
+    try {
+      await fs.writeFile(filePath, content, "utf-8");
+      return { content: [{ type: "text", text: `Wrote to ${filePath}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: edit_file** - Make selective edits to a file using pattern matching
+server.tool(
+  "edit_file",
+  {
+    path: z.string().describe("The path to the file to edit"),
+    edits: z
+      .array(
+        z.object({
+          oldText: z.string().describe("Text to replace"),
+          newText: z.string().describe("Text to insert"),
+        })
+      )
+      .describe("Array of edit operations"),
+    dryRun: z.boolean().optional().default(false).describe("If true, preview changes without applying"),
+  },
+  async ({ path: filePath, edits, dryRun }) => {
+    if (!isPathAllowed(filePath)) {
+      return { content: [{ type: "text", text: "Error: Access denied" }], isError: true };
+    }
+    try {
+      let content = await fs.readFile(filePath, "utf-8");
+      let newContent = content;
+      edits.forEach(({ oldText, newText }) => {
+        newContent = newContent.replaceAll(oldText, newText);
+      });
+      if (dryRun) {
+        return { content: [{ type: "text", text: `Dry run: New content would be:\n${newContent}` }] };
+      } else {
+        await fs.writeFile(filePath, newContent, "utf-8");
+        return { content: [{ type: "text", text: `Applied edits to ${filePath}` }] };
+      }
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: create_directory** - Create a new directory or ensure it exists
+server.tool(
+  "create_directory",
+  { path: z.string().describe("The path to the directory to create") },
+  async ({ path: dirPath }) => {
+    if (!isPathAllowed(dirPath)) {
+      return { content: [{ type: "text", text: "Error: Access denied" }], isError: true };
+    }
+    try {
+      await fs.mkdir(dirPath, { recursive: true });
+      return { content: [{ type: "text", text: `Created directory ${dirPath}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: list_directory** - List contents of a directory
+server.tool(
+  "list_directory",
+  { path: z.string().describe("The path to the directory to list") },
+  async ({ path: dirPath }) => {
+    if (!isPathAllowed(dirPath)) {
+      return { content: [{ type: "text", text: "Error: Access denied" }], isError: true };
+    }
+    try {
+      const entries = await fs.readdir(dirPath, { withFileTypes: true });
+      const listing = entries
+        .map(entry => (entry.isDirectory() ? `[DIR] ${entry.name}` : `[FILE] ${entry.name}`))
+        .join("\n");
+      return { content: [{ type: "text", text: listing || "Directory is empty" }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: move_file** - Move or rename files and directories
+server.tool(
+  "move_file",
+  {
+    source: z.string().describe("The source path of the file or directory"),
+    destination: z.string().describe("The destination path"),
+  },
+  async ({ source, destination }) => {
+    if (!isPathAllowed(source) || !isPathAllowed(destination)) {
+      return { content: [{ type: "text", text: "Error: Access denied" }], isError: true };
+    }
+    try {
+      await fs.rename(source, destination);
+      return { content: [{ type: "text", text: `Moved ${source} to ${destination}` }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: search_files** - Recursively search for files matching a pattern
+server.tool(
+  "search_files",
+  {
+    path: z.string().describe("The directory path to search in"),
+    pattern: z.string().describe("The pattern to match files (e.g., '*.txt')"),
+    excludePatterns: z
+      .array(z.string())
+      .optional()
+      .describe("Patterns to exclude (e.g., '*.log')"),
+  },
+  async ({ path: dirPath, pattern, excludePatterns }) => {
+    if (!isPathAllowed(dirPath)) {
+      return { content: [{ type: "text", text: "Error: Access denied" }], isError: true };
+    }
+    try {
+      const files = await searchFiles(dirPath, pattern);
+      const excludeRegexes = excludePatterns?.map(p => new RegExp(p.replace(/\*/g, ".*"), "i")) || [];
+      const filteredFiles = files.filter(file => !excludeRegexes.some(regex => regex.test(file)));
+      return {
+        content: [{ type: "text", text: filteredFiles.join("\n") || "No files found" }],
+      };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: get_file_info** - Get detailed metadata about a file or directory
+server.tool(
+  "get_file_info",
+  { path: z.string().describe("The path to the file or directory") },
+  async ({ path: filePath }) => {
+    if (!isPathAllowed(filePath)) {
+      return { content: [{ type: "text", text: "Error: Access denied" }], isError: true };
+    }
+    try {
+      const stats = await fs.stat(filePath);
+      const info = {
+        path: filePath,
+        size: stats.size,
+        created: stats.birthtime.toISOString(),
+        modified: stats.mtime.toISOString(),
+        accessed: stats.atime.toISOString(),
+        type: stats.isDirectory() ? "directory" : "file",
+        permissions: stats.mode.toString(8), // Octal representation
+      };
+      return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: list_allowed_directories** - List all directories the server can access
+server.tool("list_allowed_directories", {}, async () => {
+  try {
+    return { content: [{ type: "text", text: ALLOWED_DIRS.join("\n") || "No allowed directories set" }] };
+  } catch (error) {
+    return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+  }
+});
+
+// Start the server
+server.start();
+
+=== /Users/damionrashford/chatbot-project/mcp/fetchapi.js ===
+// mcp/fetchapi.js
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+
+const server = new McpServer({ name: "FetchAPI", version: "1.0.0" });
+
+// **Tool: fetch_get** - Perform an HTTP GET request
+server.tool(
+  "fetch_get",
+  {
+    url: z.string().url().describe("The URL to send the GET request to"),
+    headers: z.record(z.string()).optional().describe("Optional headers as key-value pairs"),
+    context: z.string().optional().describe("Conversation history for context"),
+    prompt: z.string().optional().describe("Prompt guiding the request")
+  },
+  async ({ url, headers, context, prompt }) => {
+    try {
+      // Internal thought process
+      const thoughts = [];
+      thoughts.push(`Received GET request for URL: "${url}"`);
+      thoughts.push(`Prompt: "${prompt || 'No prompt provided'}"`);
+      thoughts.push("Step 1: Validating request parameters");
+
+      // Validate URL
+      thoughts.push(`Validated URL: ${url}`);
+      if (headers) {
+        thoughts.push(`Headers provided: ${JSON.stringify(headers)}`);
+      } else {
+        thoughts.push("No headers provided");
+      }
+
+      // Check context for additional guidance
+      if (context) {
+        thoughts.push("Step 2: Analyzing context for request customization");
+        try {
+          const parsedContext = JSON.parse(context);
+          const lastChat = parsedContext[parsedContext.length - 1];
+          if (lastChat && lastChat.content.includes("use bearer token")) {
+            headers = { ...headers, Authorization: `Bearer ${process.env.FETCH_API_TOKEN || 'default-token'}` };
+            thoughts.push("Context suggests adding bearer token to headers");
+          }
+        } catch (e) {
+          thoughts.push("Context parsing failed, proceeding without customization");
+        }
+      }
+
+      // Use prompt to guide execution
+      const requestDescription = prompt ? prompt : `Perform a GET request to "${url}"`;
+      thoughts.push(`Request description: ${requestDescription}`);
+
+      // Perform the GET request
+      thoughts.push("Step 3: Sending GET request");
+      const response = await fetch(url, {
+        method: "GET",
+        headers
+      });
+
+      // Handle response
+      thoughts.push("Step 4: Processing response");
+      if (!response.ok) {
+        thoughts.push(`Response error: ${response.status} ${response.statusText}`);
+        throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
+      }
+      const data = await response.text(); // Use text to handle various response types
+      thoughts.push(`Received response: ${data.slice(0, 100)}...`);
+
+      // Log thought process
+      console.log(`FetchAPI thoughts: ${thoughts.join(' -> ')}`);
+
+      return { content: [{ type: "text", text: data }] };
+    } catch (error) {
+      console.error(`FetchAPI error: ${error.message}`);
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: fetch_post** - Perform an HTTP POST request
+server.tool(
+  "fetch_post",
+  {
+    url: z.string().url().describe("The URL to send the POST request to"),
+    body: z.any().describe("The request body (will be JSON-stringified)"),
+    headers: z.record(z.string()).optional().describe("Optional headers as key-value pairs"),
+    context: z.string().optional().describe("Conversation history for context"),
+    prompt: z.string().optional().describe("Prompt guiding the request")
+  },
+  async ({ url, body, headers, context, prompt }) => {
+    try {
+      // Internal thought process
+      const thoughts = [];
+      thoughts.push(`Received POST request for URL: "${url}"`);
+      thoughts.push(`Prompt: "${prompt || 'No prompt provided'}"`);
+      thoughts.push("Step 1: Validating request parameters");
+
+      // Validate URL and body
+      thoughts.push(`Validated URL: ${url}`);
+      if (body) {
+        thoughts.push(`Body provided: ${JSON.stringify(body).slice(0, 100)}...`);
+      } else {
+        thoughts.push("No body provided, using empty object");
+        body = {};
+      }
+      if (headers) {
+        thoughts.push(`Headers provided: ${JSON.stringify(headers)}`);
+      } else {
+        thoughts.push("No headers provided, using default JSON content-type");
+        headers = { "Content-Type": "application/json" };
+      }
+
+      // Check context for additional guidance
+      if (context) {
+        thoughts.push("Step 2: Analyzing context for request customization");
+        try {
+          const parsedContext = JSON.parse(context);
+          const lastChat = parsedContext[parsedContext.length - 1];
+          if (lastChat && lastChat.content.includes("use bearer token")) {
+            headers = { ...headers, Authorization: `Bearer ${process.env.FETCH_API_TOKEN || 'default-token'}` };
+            thoughts.push("Context suggests adding bearer token to headers");
+          }
+        } catch (e) {
+          thoughts.push("Context parsing failed, proceeding without customization");
+        }
+      }
+
+      // Use prompt to guide execution
+      const requestDescription = prompt ? prompt : `Perform a POST request to "${url}" with body: ${JSON.stringify(body)}`;
+      thoughts.push(`Request description: ${requestDescription}`);
+
+      // Perform the POST request
+      thoughts.push("Step 3: Sending POST request");
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body)
+      });
+
+      // Handle response
+      thoughts.push("Step 4: Processing response");
+      if (!response.ok) {
+        thoughts.push(`Response error: ${response.status} ${response.statusText}`);
+        throw new Error(`HTTP error ${response.status}: ${response.statusText}`);
+      }
+      const data = await response.text(); // Use text to handle various response types
+      thoughts.push(`Received response: ${data.slice(0, 100)}...`);
+
+      // Log thought process
+      console.log(`FetchAPI thoughts: ${thoughts.join(' -> ')}`);
+
+      return { content: [{ type: "text", text: data }] };
+    } catch (error) {
+      console.error(`FetchAPI error: ${error.message}`);
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// Start the server
+server.start();
+
+=== /Users/damionrashford/chatbot-project/mcp/email.js ===
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import nodemailer from "nodemailer";
+import fs from "fs/promises";
+import path from "path";
+
+// SMTP configuration (example for Gmail; adjust as needed)
+const SMTP_CONFIG = {
+  service: "gmail",
+  auth: {
+    user: process.env.SENDER, // e.g., "user@gmail.com"
+    pass: process.env.PASSWORD, // App-specific password if using Gmail
+  },
+};
+
+const transporter = nodemailer.createTransport(SMTP_CONFIG);
+
+// Allowed directories for attachment search (default to current directory if not set)
+const ATTACHMENT_DIRS = process.env.ATTACHMENT_DIRS
+  ? process.env.ATTACHMENT_DIRS.split(",").map(dir => path.resolve(dir))
+  : [path.resolve(process.cwd())];
+
+function isPathAllowed(filePath) {
+  const absPath = path.resolve(filePath);
+  return ATTACHMENT_DIRS.some(dir => absPath.startsWith(dir + path.sep));
+}
+
+// Helper function to search for attachments
+async function searchAttachments(pattern) {
+  const results = [];
+  const regex = new RegExp(pattern.replace(/\*/g, ".*"), "i");
+  for (const dir of ATTACHMENT_DIRS) {
+    async function traverse(currentPath) {
+      const entries = await fs.readdir(currentPath, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(currentPath, entry.name);
+        if (entry.isDirectory()) {
+          await traverse(fullPath);
+        } else if (regex.test(entry.name)) {
+          results.push(fullPath);
+        }
+      }
+    }
+    await traverse(dir);
+  }
+  return results;
+}
+
+const server = new McpServer({ name: "Email", version: "1.0.0" });
+
+// **Tool: send_email** - Send an email with optional attachments
+server.tool(
+  "send_email",
+  {
+    receiver: z.array(z.string()).describe("Array of recipient email addresses"),
+    subject: z.string().describe("Email subject"),
+    body: z.string().describe("Email body text"),
+    attachments: z.array(z.string()).optional().describe("Array of file paths to attach"),
+  },
+  async ({ receiver, subject, body, attachments }) => {
+    try {
+      if (attachments) {
+        for (const filePath of attachments) {
+          if (!isPathAllowed(filePath)) {
+            return { content: [{ type: "text", text: `Error: Access denied to ${filePath}` }], isError: true };
+          }
+          await fs.access(filePath); // Check if file exists
+        }
+      }
+      const mailOptions = {
+        from: process.env.SENDER,
+        to: receiver.join(","),
+        subject,
+        text: body,
+        attachments: attachments?.map(file => ({ path: file })),
+      };
+      await transporter.sendMail(mailOptions);
+      return { content: [{ type: "text", text: "Email sent successfully" }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: search_attachments** - Search for files to attach
+server.tool(
+  "search_attachments",
+  { pattern: z.string().describe("Pattern to match files (e.g., '*.pdf')") },
+  async ({ pattern }) => {
+    try {
+      const files = await searchAttachments(pattern);
+      return { content: [{ type: "text", text: files.join("\n") || "No matching files found" }] };
+    } catch (error) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// Start the server
+server.start();
+
+=== /Users/damionrashford/chatbot-project/mcp/chatstore.js ===
+// mcp/chatstore.js
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+
+const DB_NAME = 'chatbotDB';
+const DB_VERSION = 2;
+let db;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onerror = (event) => reject(event.target.error);
+    request.onsuccess = (event) => {
+      db = event.target.result;
+      resolve(db);
+    };
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (event.oldVersion < 1) {
+        db.createObjectStore('settings', { keyPath: 'key' });
+        const chatStore = db.createObjectStore('chats', { keyPath: 'id', autoIncrement: true });
+        chatStore.createIndex('timestamp', 'timestamp', { unique: false });
+      }
+      if (event.oldVersion < 2) {
+        const chatStore = db.transaction(['chats'], 'readwrite').objectStore('chats');
+        chatStore.createIndex('sessionId', 'sessionId', { unique: false });
+      }
+    });
+  });
+}
+
+async function saveSetting(key, value, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const transaction = db.transaction(['settings'], 'readwrite');
+      const store = transaction.objectStore('settings');
+      const request = store.put({ key, value });
+      await new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve();
+        request.onerror = (event) => reject(event.target.error);
+      });
+      return;
+    } catch (error) {
+      if (attempt === retries) throw new Error(`Failed to save setting after ${retries} attempts: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
+
+async function getSetting(key, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const transaction = db.transaction(['settings'], 'readonly');
+      const store = transaction.objectStore('settings');
+      const request = store.get(key);
+      const result = await new Promise((resolve, reject) => {
+        request.onsuccess = (event) => resolve(event.target.result ? event.target.result.value : null);
+        request.onerror = (event) => reject(event.target.error);
+      });
+      return result;
+    } catch (error) {
+      if (attempt === retries) throw new Error(`Failed to get setting after ${retries} attempts: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
+
+async function saveChat(chat, sessionId, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const transaction = db.transaction(['chats'], 'readwrite');
+      const store = transaction.objectStore('chats');
+      const request = store.add({ ...chat, sessionId, timestamp: Date.now() });
+      await new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve();
+        request.onerror = (event) => reject(event.target.error);
+      });
+      return;
+    } catch (error) {
+      if (attempt === retries) throw new Error(`Failed to save chat after ${retries} attempts: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
+
+async function getChats(sessionId, limit = 10, query = null, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const transaction = db.transaction(['chats'], 'readonly');
+      const store = transaction.objectStore('chats');
+      const index = store.index('sessionId');
+      const request = index.getAll(IDBKeyRange.only(sessionId));
+      let chats = await new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = (event) => reject(event.target.error);
+      });
+      // Filter by query if provided
+      if (query) {
+        const lowerQuery = query.toLowerCase();
+        chats = chats.filter(chat => chat.content.toLowerCase().includes(lowerQuery));
+      }
+      // Sort by timestamp descending and limit
+      return chats.sort((a, b) => b.timestamp - a.timestamp).slice(0, limit);
+    } catch (error) {
+      if (attempt === retries) throw new Error(`Failed to get chats after ${retries} attempts: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
+
+// Initialize the database
+async function initDB() {
+  try {
+    await openDB();
+    console.log('Chatstore database initialized');
+  } catch (error) {
+    console.error('Failed to initialize chatstore database:', error);
+    throw error;
+  }
+}
+
+// Create the MCP server
+const server = new McpServer({ name: "Chatstore", version: "1.0.0" });
+
+// **Tool: save_chat** - Save a chat message to the database
+server.tool(
+  "save_chat",
+  {
+    role: z.enum(['user', 'assistant', 'system']).describe("The role of the message sender"),
+    content: z.string().describe("The content of the chat message"),
+    sessionId: z.string().describe("The session ID for the chat"),
+    prompt: z.string().optional().describe("Prompt guiding the save operation")
+  },
+  async ({ role, content, sessionId, prompt }) => {
+    try {
+      const thoughts = [];
+      thoughts.push(`Saving chat: role=${role}, content="${content}", sessionId=${sessionId}`);
+      thoughts.push(`Prompt: "${prompt || 'No prompt provided'}"`);
+      thoughts.push("Step 1: Validating parameters");
+
+      if (!sessionId) {
+        thoughts.push("No sessionId provided, rejecting");
+        throw new Error("Session ID is required");
+      }
+      thoughts.push("Parameters validated");
+
+      thoughts.push("Step 2: Saving chat to database");
+      await saveChat({ role, content }, sessionId);
+      thoughts.push("Chat saved successfully");
+
+      console.log(`Chatstore thoughts: ${thoughts.join(' -> ')}`);
+      return { content: [{ type: "text", text: "Chat message saved successfully" }] };
+    } catch (error) {
+      console.error(`Chatstore error: ${error.message}`);
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: get_chats** - Retrieve chat messages
+server.tool(
+  "get_chats",
+  {
+    sessionId: z.string().describe("The session ID for the chats"),
+    limit: z.number().optional().default(10).describe("Maximum number of chats to retrieve"),
+    query: z.string().optional().describe("Optional query to filter chats by content"),
+    prompt: z.string().optional().describe("Prompt guiding the retrieval")
+  },
+  async ({ sessionId, limit, query, prompt }) => {
+    try {
+      const thoughts = [];
+      thoughts.push(`Retrieving chats: sessionId=${sessionId}, limit=${limit}, query="${query || 'none'}"`);
+      thoughts.push(`Prompt: "${prompt || 'No prompt provided'}"`);
+      thoughts.push("Step 1: Validating parameters");
+
+      if (!sessionId) {
+        thoughts.push("No sessionId provided, rejecting");
+        throw new Error("Session ID is required");
+      }
+      thoughts.push("Parameters validated");
+
+      thoughts.push("Step 2: Fetching chats from database");
+      const chats = await getChats(sessionId, limit, query);
+      thoughts.push(`Retrieved ${chats.length} chats`);
+
+      console.log(`Chatstore thoughts: ${thoughts.join(' -> ')}`);
+      return { content: [{ type: "text", text: JSON.stringify(chats, null, 2) }] };
+    } catch (error) {
+      console.error(`Chatstore error: ${error.message}`);
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Resource: chat_history** - Access chat history as a resource
+server.resource(
+  "chat_history",
+  new ResourceTemplate("chat://history/{sessionId}", { list: undefined }),
+  async (uri, { sessionId }) => {
+    try {
+      const thoughts = [];
+      thoughts.push(`Accessing chat history for sessionId=${sessionId}`);
+      thoughts.push("Step 1: Fetching chats");
+
+      const chats = await getChats(sessionId, 10);
+      thoughts.push(`Retrieved ${chats.length} chats`);
+
+      console.log(`Chatstore thoughts: ${thoughts.join(' -> ')}`);
+      return {
+        contents: [{
+          uri: uri.href,
+          text: JSON.stringify(chats, null, 2)
+        }]
+      };
+    } catch (error) {
+      console.error(`Chatstore error: ${error.message}`);
+      throw new Error(`Failed to retrieve chat history: ${error.message}`);
+    }
+  }
+);
+
+// **Resource: settings** - Access a specific setting by key
+server.resource(
+  "settings",
+  new ResourceTemplate("settings://{key}", { list: undefined }),
+  async (uri, { key }) => {
+    try {
+      const thoughts = [];
+      thoughts.push(`Accessing setting: key=${key}`);
+      thoughts.push("Step 1: Fetching setting");
+
+      const value = await getSetting(key);
+      if (value === null) {
+        thoughts.push(`Setting '${key}' not found`);
+        throw new Error(`Setting '${key}' not found`);
+      }
+      thoughts.push(`Retrieved setting: ${JSON.stringify(value)}`);
+
+      console.log(`Chatstore thoughts: ${thoughts.join(' -> ')}`);
+      return {
+        contents: [{
+          uri: uri.href,
+          text: JSON.stringify(value, null, 2)
+        }]
+      };
+    } catch (error) {
+      console.error(`Chatstore error: ${error.message}`);
+      throw new Error(`Failed to retrieve setting '${key}': ${error.message}`);
+    }
+  }
+);
+
+// Initialize and start the server
+initDB().then(() => {
+  server.start();
+}).catch(error => {
+  console.error('Failed to start Chatstore MCP server:', error);
+});
+
+=== /Users/damionrashford/chatbot-project/frontend/ui.js ===
+// frontend/ui.js
+let chatHistory, inputField, apiKeyInput, modelSelect, themeToggle, chatView, settingsView;
+const style = document.createElement('style');
+document.head.appendChild(style);
+
+function setTheme(theme) {
+  document.body.className = theme;
+  setStyles();
+}
+
+function setStyles() {
+  const isDark = document.body.className === 'dark';
+  style.textContent = `
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: ${isDark ? '#333' : 'white'};
+      color: ${isDark ? 'white' : 'black'};
+    }
+    .main-container {
+      display: flex;
+      height: 100vh;
+    }
+    .sidebar {
+      width: 200px;
+      background-color: ${isDark ? '#444' : '#f0f0f0'};
+      padding: 10px;
+    }
+    .nav-button {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 5px;
+      background-color: ${isDark ? '#555' : '#ddd'};
+      border: none;
+      cursor: pointer;
+    }
+    .content-area {
+      flex: 1;
+      padding: 20px;
+    }
+    .chat-view, .settings-view {
+      display: none;
+    }
+    .chat-history {
+      height: 70vh;
+      overflow-y: scroll;
+      padding: 10px;
+      border: 1px solid ${isDark ? '#555' : '#ccc'};
+      margin-bottom: 10px;
+      background-color: ${isDark ? '#444' : 'white'};
+    }
+    .input-area {
+      display: flex;
+    }
+    .input-area input {
+      flex: 1;
+      padding: 5px;
+    }
+    .input-area button {
+      margin-left: 10px;
+      padding: 5px 10px;
+    }
+    .settings-form {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .user-message {
+      text-align: right;
+      background-color: ${isDark ? '#0056b3' : '#007bff'};
+      color: white;
+      padding: 5px;
+      margin: 5px;
+      border-radius: 5px;
+    }
+    .assistant-message {
+      text-align: left;
+      background-color: ${isDark ? '#555' : '#f0f0f0'};
+      padding: 5px;
+      margin: 5px;
+      border-radius: 5px;
+    }
+    .system-message {
+      text-align: center;
+      color: red;
+      font-style: italic;
+    }
+  `;
+}
+
+function createUI() {
+  const mainContainer = document.createElement('div');
+  mainContainer.className = 'main-container';
+  document.body.appendChild(mainContainer);
+
+  const sidebar = document.createElement('div');
+  sidebar.className = 'sidebar';
+  const chatNav = document.createElement('button');
+  chatNav.className = 'nav-button';
+  chatNav.textContent = 'Chat';
+  chatNav.onclick = () => showView('chat');
+  const settingsNav = document.createElement('button');
+  settingsNav.className = 'nav-button';
+  settingsNav.textContent = 'Settings';
+  settingsNav.onclick = () => showView('settings');
+  sidebar.appendChild(chatNav);
+  sidebar.appendChild(settingsNav);
+  mainContainer.appendChild(sidebar);
+
+  const contentArea = document.createElement('div');
+  contentArea.className = 'content-area';
+  mainContainer.appendChild(contentArea);
+
+  chatView = document.createElement('div');
+  chatView.className = 'chat-view';
+  chatHistory = document.createElement('div');
+  chatHistory.className = 'chat-history';
+  const inputArea = document.createElement('div');
+  inputArea.className = 'input-area';
+  inputField = document.createElement('input');
+  inputField.type = 'text';
+  const sendButton = document.createElement('button');
+  sendButton.textContent = 'Send';
+  const cancelButton = document.createElement('button');
+  cancelButton.textContent = 'Cancel';
+  cancelButton.style.display = 'none';
+  inputArea.appendChild(inputField);
+  inputArea.appendChild(sendButton);
+  inputArea.appendChild(cancelButton);
+  chatView.appendChild(chatHistory);
+  chatView.appendChild(inputArea);
+  contentArea.appendChild(chatView);
+
+  settingsView = document.createElement('div');
+  settingsView.className = 'settings-view';
+  const settingsForm = document.createElement('div');
+  settingsForm.className = 'settings-form';
+  const apiKeyLabel = document.createElement('label');
+  apiKeyLabel.textContent = 'API Key:';
+  apiKeyInput = document.createElement('input');
+  apiKeyInput.type = 'text';
+  apiKeyInput.onblur = () => {
+    apiKey = apiKeyInput.value;
+    saveSetting('apiKey', apiKey).then(populateModels);
+  };
+  const modelLabel = document.createElement('label');
+  modelLabel.textContent = 'Select Free Model:';
+  modelSelect = document.createElement('select');
+  const themeLabel = document.createElement('label');
+  themeLabel.textContent = 'Dark Mode:';
+  themeToggle = document.createElement('input');
+  themeToggle.type = 'checkbox';
+  themeToggle.onchange = () => {
+    const theme = themeToggle.checked ? 'dark' : 'light';
+    setTheme(theme);
+    saveSetting('theme', theme);
+  };
+  settingsForm.appendChild(apiKeyLabel);
+  settingsForm.appendChild(apiKeyInput);
+  settingsForm.appendChild(modelLabel);
+  settingsForm.appendChild(modelSelect);
+  settingsForm.appendChild(themeLabel);
+  settingsForm.appendChild(themeToggle);
+  settingsView.appendChild(settingsForm);
+  contentArea.appendChild(settingsView);
+
+  sendButton.addEventListener('click', () => sendMessage(cancelButton));
+  cancelButton.addEventListener('click', () => cancelStream());
+  inputField.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      sendMessage(cancelButton);
+    }
+  });
+}
+
+function showView(view) {
+  chatView.style.display = view === 'chat' ? 'block' : 'none';
+  settingsView.style.display = view === 'settings' ? 'block' : 'none';
+  if (view === 'settings') populateModels();
+}
+
+=== /Users/damionrashford/chatbot-project/frontend/main.js ===
+// frontend/main.js
+let streamController = null;
+let apiKey = '';
+let orchestrator = null;
+let sessionId = null;
+
+async function init() {
+  await openDB();
+  const theme = await getSetting('theme') || 'light';
+  setTheme(theme);
+  apiKey = await getSetting('apiKey') || '';
+  sessionId = await getSetting('sessionId') || generateSessionId();
+  await saveSetting('sessionId', sessionId);
+  createUI();
+  themeToggle.checked = theme === 'dark';
+  apiKeyInput.value = apiKey;
+  createSettingsForm();
+  if (apiKey) {
+    await populateModels();
+  } else {
+    addMessageToHistory('system', 'Please enter your API key in settings.');
+  }
+  const chats = await getChats(sessionId);
+  chats.forEach(chat => addMessageToHistory(chat.role, chat.content));
+  showView('chat');
+
+  // Initialize orchestrator
+  const Orchestrator = (await import('../../agents/orchestrator.js')).default;
+  orchestrator = new Orchestrator();
+  await orchestrator.setupClients();
+  console.log('Orchestrator initialized');
+
+  // Periodic cleanup of old chats
+  setInterval(() => cleanupChats(30).catch(e => console.error('Cleanup failed:', e)), 24 * 60 * 60 * 1000); // Daily
+}
+
+function generateSessionId() {
+  return 'sess_' + Math.random().toString(36).substr(2, 9) + '_' + Date.now();
+}
+
+async function populateModels() {
+  const models = await fetchModels();
+  modelSelect.innerHTML = '';
+  models.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m.id;
+    opt.textContent = m.name || m.id;
+    modelSelect.appendChild(opt);
+  });
+  const savedModel = await getSetting('selectedModel');
+  if (savedModel && models.some(m => m.id === savedModel)) {
+    modelSelect.value = savedModel;
+  } else if (models.length) {
+    modelSelect.value = models[0].id;
+    await saveSetting('selectedModel', models[0].id);
+  }
+  modelSelect.onchange = () => saveSetting('selectedModel', modelSelect.value);
+}
+
+async function sendMessage(cancelButton) {
+  const text = inputField.value.trim();
+  if (!text) return;
+  addMessageToHistory('user', text);
+  await saveChat({ role: 'user', content: text }, sessionId);
+  inputField.value = '';
+  if (!apiKey || !modelSelect.value) {
+    addMessageToHistory('system', 'Please set API key and select a model in settings.');
+    return;
+  }
+
+  const typingMsg = document.createElement('div');
+  typingMsg.className = 'system-message';
+  typingMsg.textContent = 'Bot is typing...';
+  chatHistory.appendChild(typingMsg);
+
+  try {
+    // Use orchestrator for agent-driven tasks
+    const chats = await getChats(sessionId);
+    const messages = chats.map(chat => ({ role: chat.role, content: chat.content }));
+    messages.push({ role: 'user', content: text });
+
+    // Check if task is agent-related
+    const lowerText = text.toLowerCase();
+    const agentKeywords = ["calculate", "translate", "email", "file", "news", "whois", "history", "fetch", "http"];
+    if (agentKeywords.some(keyword => lowerText.includes(keyword))) {
+      await orchestrator.handleMessage(text, sessionId, (response) => {
+        chatHistory.removeChild(typingMsg);
+        addMessageToHistory('assistant', response);
+      });
+      return;
+    }
+
+    // Fallback to API for non-agent tasks
+    const settings = getSettings();
+    const options = {
+      model: modelSelect.value,
+      models: settings.fallbackModels || [],
+      provider: {
+        order: settings.providerOrder,
+        allow_fallbacks: settings.allowFallbacks,
+        require_parameters: settings.requireParameters,
+        data_collection: settings.dataCollection,
+        ignore: settings.ignoreProviders,
+        quantizations: settings.quantizations,
+        sort: settings.sort || undefined
+      },
+      stream: settings.stream,
+      maxTokens: settings.maxTokens,
+      temperature: settings.temperature,
+      topP: settings.topP,
+      topK: settings.topK,
+      frequencyPenalty: settings.frequencyPenalty,
+      presencePenalty: settings.presencePenalty,
+      repetitionPenalty: settings.repetitionPenalty,
+      minP: settings.minP,
+      topA: settings.topA,
+      seed: settings.seed,
+      responseFormat: settings.responseFormat,
+      stop: settings.stop,
+      maxPrice: settings.maxPrice
+    };
+
+    const credits = await checkCredits();
+    if (credits && credits.data.usage >= (credits.data.limit || Infinity)) {
+      throw new Error('Insufficient credits. Please add more credits.');
+    }
+
+    const result = await sendMessageToAPI(messages, options);
+    chatHistory.removeChild(typingMsg);
+
+    if (settings.stream) {
+      cancelButton.style.display = 'inline';
+      streamController = result.controller;
+      const reply = await processStream(result.stream, result.controller);
+      await saveChat({ role: 'assistant', content: reply }, sessionId);
+      cancelButton.style.display = 'none';
+    } else {
+      addMessageToHistory('assistant', result.content);
+      await saveChat({ role: 'assistant', content: result.content }, sessionId);
+    }
+  } catch (e) {
+    chatHistory.removeChild(typingMsg);
+    addMessageToHistory('system', `Error: ${e.message}`);
+    await saveChat({ role: 'system', content: `Error: ${e.message}` }, sessionId);
+  }
+}
+
+function cancelStream() {
+  if (streamController) {
+    streamController.abort();
+    streamController = null;
+    addMessageToHistory('system', 'Stream cancelled.');
+    saveChat({ role: 'system', content: 'Stream cancelled.' }, sessionId);
+  }
+}
+
+init().catch(console.error);
+
+=== /Users/damionrashford/chatbot-project/frontend/index.html ===
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chatbot</title>
+</head>
+<body>
+  <script src="../backend/db.js"></script>
+  <script src="../backend/api.js"></script>
+  <script src="ui.js"></script>
+  <script src="../utils/utils.js"></script>
+  <script src="../config/settings.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>
+
+=== /Users/damionrashford/chatbot-project/config/settings.js ===
+// config/settings.js
+let settingsForm;
+
+function createSettingsForm() {
+  settingsForm = document.querySelector('.settings-form');
+
+  const fields = [
+    { label: 'Fallback Models (comma-separated)', id: 'fallbackModels', type: 'text' },
+    { label: 'Provider Order (comma-separated)', id: 'providerOrder', type: 'text' },
+    { label: 'Allow Fallbacks', id: 'allowFallbacks', type: 'checkbox', default: true },
+    { label: 'Require Parameters', id: 'requireParameters', type: 'checkbox' },
+    { label: 'Data Collection', id: 'dataCollection', type: 'select', options: ['allow', 'deny'], default: 'allow' },
+    { label: 'Ignore Providers (comma-separated)', id: 'ignoreProviders', type: 'text' },
+    { label: 'Quantizations (comma-separated)', id: 'quantizations', type: 'text' },
+    { label: 'Sort', id: 'sort', type: 'select', options: ['', 'price', 'throughput', 'latency'] },
+    { label: 'Stream', id: 'stream', type: 'checkbox' },
+    { label: 'Max Tokens', id: 'maxTokens', type: 'number', min: 1 },
+    { label: 'Temperature (0-2)', id: 'temperature', type: 'number', min: 0, max: 2, step: 0.1, default: 1.0 },
+    { label: 'Top P (0-1)', id: 'topP', type: 'number', min: 0, max: 1, step: 0.1, default: 1.0 },
+    { label: 'Top K', id: 'topK', type: 'number', min: 0, default: 0 },
+    { label: 'Frequency Penalty (-2-2)', id: 'frequencyPenalty', type: 'number', min: -2, max: 2, step: 0.1, default: 0 },
+    { label: 'Presence Penalty (-2-2)', id: 'presencePenalty', type: 'number', min: -2, max: 2, step: 0.1, default: 0 },
+    { label: 'Repetition Penalty (0-2)', id: 'repetitionPenalty', type: 'number', min: 0, max: 2, step: 0.1, default: 1.0 },
+    { label: 'Min P (0-1)', id: 'minP', type: 'number', min: 0, max: 1, step: 0.1, default: 0 },
+    { label: 'Top A (0-1)', id: 'topA', type: 'number', min: 0, max: 1, step: 0.1, default: 0 },
+    { label: 'Seed', id: 'seed', type: 'number' },
+    { label: 'Response Format (json_object)', id: 'responseFormat', type: 'text' },
+    { label: 'Stop Sequences (comma-separated)', id: 'stop', type: 'text' },
+    { label: 'Max Price Prompt ($/M)', id: 'maxPricePrompt', type: 'number', step: 0.1 },
+    { label: 'Max Price Completion ($/M)', id: 'maxPriceCompletion', type: 'number', step: 0.1 }
+  ];
+
+  fields.forEach(field => {
+    const label = document.createElement('label');
+    label.textContent = field.label;
+    let input;
+    if (field.type === 'select') {
+      input = document.createElement('select');
+      field.options.forEach(opt => {
+        const option = document.createElement('option');
+        option.value = opt;
+        option.textContent = opt || 'None';
+        input.appendChild(option);
+      });
+      if (field.default) input.value = field.default;
+    } else if (field.type === 'checkbox') {
+      input = document.createElement('input');
+      input.type = 'checkbox';
+      input.checked = field.default || false;
+    } else {
+      input = document.createElement('input');
+      input.type = field.type;
+      if (field.min !== undefined) input.min = field.min;
+      if (field.max !== undefined) input.max = field.max;
+      if (field.step) input.step = field.step;
+      if (field.default !== undefined) input.value = field.default;
+    }
+    input.id = field.id;
+    settingsForm.appendChild(label);
+    settingsForm.appendChild(input);
+  });
+}
+
+function getSettings() {
+  const settings = {};
+  const inputs = settingsForm.querySelectorAll('input, select');
+  inputs.forEach(input => {
+    if (input.type === 'checkbox') {
+      settings[input.id] = input.checked;
+    } else if (input.value) {
+      if (['fallbackModels', 'providerOrder', 'ignoreProviders', 'quantizations', 'stop'].includes(input.id)) {
+        settings[input.id] = input.value.split(',').map(s => s.trim()).filter(s => s);
+      } else if (['maxPricePrompt', 'maxPriceCompletion'].includes(input.id)) {
+        settings.maxPrice = settings.maxPrice || {};
+        settings.maxPrice[input.id === 'maxPricePrompt' ? 'prompt' : 'completion'] = parseFloat(input.value);
+      } else if (input.id === 'responseFormat' && input.value) {
+        settings[input.id] = { type: input.value };
+      } else {
+        settings[input.id] = input.type === 'number' ? parseFloat(input.value) : input.value;
+      }
+    }
+  });
+  return settings;
+}
+
+=== /Users/damionrashford/chatbot-project/backend/db.js ===
+// backend/db.js
+const DB_NAME = 'chatbotDB';
+const DB_VERSION = 2; // Updated version for schema changes
+let db;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onerror = (event) => reject(event.target.error);
+    request.onsuccess = (event) => {
+      db = event.target.result;
+      resolve(db);
+    };
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (event.oldVersion < 1) {
+        db.createObjectStore('settings', { keyPath: 'key' });
+        const chatStore = db.createObjectStore('chats', { keyPath: 'id', autoIncrement: true });
+        chatStore.createIndex('timestamp', 'timestamp', { unique: false });
+      }
+      if (event.oldVersion < 2) {
+        const chatStore = db.transaction(['chats'], 'readwrite').objectStore('chats');
+        chatStore.createIndex('sessionId', 'sessionId', { unique: false });
+      }
+    };
+  });
+}
+
+async function saveSetting(key, value, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const transaction = db.transaction(['settings'], 'readwrite');
+      const store = transaction.objectStore('settings');
+      const request = store.put({ key, value });
+      await new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve();
+        request.onerror = (event) => reject(event.target.error);
+      });
+      return;
+    } catch (error) {
+      if (attempt === retries) throw new Error(`Failed to save setting after ${retries} attempts: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
+
+async function getSetting(key, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const transaction = db.transaction(['settings'], 'readonly');
+      const store = transaction.objectStore('settings');
+      const request = store.get(key);
+      const result = await new Promise((resolve, reject) => {
+        request.onsuccess = (event) => resolve(event.target.result ? event.target.result.value : null);
+        request.onerror = (event) => reject(event.target.error);
+      });
+      return result;
+    } catch (error) {
+      if (attempt === retries) throw new Error(`Failed to get setting after ${retries} attempts: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
+
+async function saveChat(chat, sessionId, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const transaction = db.transaction(['chats'], 'readwrite');
+      const store = transaction.objectStore('chats');
+      const request = store.add({ ...chat, sessionId, timestamp: Date.now() });
+      await new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve();
+        request.onerror = (event) => reject(event.target.error);
+      });
+      return;
+    } catch (error) {
+      if (attempt === retries) throw new Error(`Failed to save chat after ${retries} attempts: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
+
+async function getChats(sessionId, limit = 50, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const transaction = db.transaction(['chats'], 'readonly');
+      const store = transaction.objectStore('chats');
+      const index = store.index('sessionId');
+      const request = index.getAll(IDBKeyRange.only(sessionId));
+      const chats = await new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = (event) => reject(event.target.error);
+      });
+      // Sort by timestamp descending and limit
+      return chats.sort((a, b) => b.timestamp - a.timestamp).slice(0, limit);
+    } catch (error) {
+      if (attempt === retries) throw new Error(`Failed to get chats after ${retries} attempts: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
+
+async function cleanupChats(maxAgeDays = 30, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const transaction = db.transaction(['chats'], 'readwrite');
+      const store = transaction.objectStore('chats');
+      const index = store.index('timestamp');
+      const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
+      const cutoff = Date.now() - maxAgeMs;
+      const request = index.openCursor(IDBKeyRange.upperBound(cutoff));
+      await new Promise((resolve, reject) => {
+        request.onsuccess = (event) => {
+          const cursor = event.target.result;
+          if (cursor) {
+            cursor.delete();
+            cursor.continue();
+          } else {
+            resolve();
+          }
+        };
+        request.onerror = (event) => reject(event.target.error);
+      });
+      return;
+    } catch (error) {
+      if (attempt === retries) throw new Error(`Failed to clean chats after ${retries} attempts: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
+
+export { openDB, saveSetting, getSetting, saveChat, getChats, cleanupChats };
+
+=== /Users/damionrashford/chatbot-project/backend/api.js ===
+// backend/api.js
+let apiKey = '';
+let siteUrl = 'https://DamionR.github.io/chatbot-project/';
+let siteName = 'Chatbot Project';
+
+async function fetchModels() {
+  if (!apiKey) return [];
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/models', {
+      headers: { 'Authorization': `Bearer ${apiKey}` }
+    });
+    if (!response.ok) throw new Error('Failed to fetch models');
+    const data = await response.json();
+    // Filter for free models where both prompt and completion pricing are "0"
+    const freeModels = data.data.filter(model => 
+      model.pricing.prompt === "0" && model.pricing.completion === "0"
+    );
+    return freeModels;
+  } catch (e) {
+    console.error('Error fetching free models:', e);
+    return [];
+  }
+}
+
+async function sendMessageToAPI(messages, options = {}) {
+  const {
+    model,
+    models = [],
+    provider = {},
+    stream = false,
+    maxTokens,
+    temperature,
+    topP,
+    topK,
+    frequencyPenalty,
+    presencePenalty,
+    repetitionPenalty,
+    minP,
+    topA,
+    seed,
+    logitBias,
+    logprobs,
+    topLogprobs,
+    responseFormat,
+    stop,
+    tools,
+    toolChoice,
+    maxPrice
+  } = options;
+
+  const body = {
+    model: model || 'openrouter/auto',
+    models: models.length ? models : undefined,
+    messages: messages.map(msg => ({
+      role: msg.role,
+      content: Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content }]
+    })),
+    provider,
+    stream,
+    max_tokens: maxTokens,
+    temperature,
+    top_p: topP,
+    top_k: topK,
+    frequency_penalty: frequencyPenalty,
+    presence_penalty: presencePenalty,
+    repetition_penalty: repetitionPenalty,
+    min_p: minP,
+    top_a: topA,
+    seed,
+    logit_bias: logitBias,
+    logprobs,
+    top_logprobs: topLogprobs,
+    response_format: responseFormat,
+    stop,
+    tools,
+    tool_choice: toolChoice,
+    max_price: maxPrice
+  };
+
+  const controller = new AbortController();
+  const headers = {
+    'Authorization': `Bearer ${apiKey}`,
+    'HTTP-Referer': siteUrl,
+    'X-Title': siteName,
+    'Content-Type': 'application/json'
+  };
+
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(`API error ${response.status}: ${errorData.error.message}`);
+    }
+
+    if (!stream) {
+      const data = await response.json();
+      return { content: data.choices[0].message.content, controller };
+    } else {
+      return { stream: response.body, controller };
+    }
+  } catch (e) {
+    throw e;
+  }
+}
+
+async function checkCredits() {
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/auth/key', {
+      headers: { 'Authorization': `Bearer ${apiKey}` }
+    });
+    if (!response.ok) throw new Error('Failed to check credits');
+    return await response.json();
+  } catch (e) {
+    console.error('Error checking credits:', e);
+    return null;
+  }
+}
+
+async function getGenerationStats(generationId) {
+  try {
+    const response = await fetch(`https://openrouter.ai/api/v1/generation?id=${generationId}`, {
+      headers: { 'Authorization': `Bearer ${apiKey}` }
+    });
+    if (!response.ok) throw new Error('Failed to fetch generation stats');
+    return await response.json();
+  } catch (e) {
+    console.error('Error fetching generation stats:', e);
+    return null;
+  }
+}
+
+=== /Users/damionrashford/chatbot-project/agents/evaluator.js ===
+// agents/evaluator.js
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+
+const server = new McpServer({ name: "Evaluator", version: "1.0.0" });
+
+// **Tool: evaluate_response** - Evaluate a response for accuracy and relevance
+server.tool(
+  "evaluate_response",
+  {
+    response: z.string().describe("The response to evaluate"),
+    context: z.string().optional().describe("Conversation history for context"),
+    sessionId: z.string().describe("The session ID for the evaluation"),
+    prompt: z.string().optional().describe("Prompt guiding the evaluation")
+  },
+  async ({ response, context, sessionId, prompt }) => {
+    try {
+      // Internal thought process
+      const thoughts = [];
+      thoughts.push(`Received response: "${response}"`);
+      thoughts.push(`Session ID: ${sessionId}`);
+      thoughts.push(`Prompt: "${prompt || 'No prompt provided'}"`);
+      thoughts.push("Step 1: Interpreting prompt and response");
+
+      // Use prompt to guide evaluation
+      const taskDescription = prompt ? prompt : `Evaluate the response: "${response}" for accuracy and relevance`;
+      thoughts.push(`Evaluation description: ${taskDescription}`);
+
+      // Basic validation
+      thoughts.push("Step 2: Checking response for basic validity");
+      if (!response || response.trim() === "") {
+        thoughts.push("Response is empty, marking as invalid");
+        throw new Error("Response is empty or invalid");
+      }
+      thoughts.push("Response is non-empty");
+
+      // Check context for relevance
+      let relevanceScore = 0.5; // Default score (0 to 1)
+      let contextData = [];
+      if (context) {
+        thoughts.push("Step 3: Analyzing context for relevance");
+        try {
+          contextData = JSON.parse(context);
+          const lastChat = contextData[contextData.length - 1];
+          if (lastChat && lastChat.content) {
+            const userQuery = lastChat.content.toLowerCase();
+            const responseLower = response.toLowerCase();
+            // Enhanced relevance check with keyword overlap
+            const queryWords = userQuery.split(/\s+/).filter(w => w.length > 3);
+            const responseWords = responseLower.split(/\s+/).filter(w => w.length > 3);
+            const commonWords = queryWords.filter(word => responseWords.includes(word));
+            relevanceScore = commonWords.length / Math.max(queryWords.length, 1);
+            thoughts.push(`Relevance score: ${relevanceScore.toFixed(2)} (based on ${commonWords.length}/${queryWords.length} common words)`);
+          } else {
+            thoughts.push("No recent user query in context, using default relevance");
+          }
+        } catch (e) {
+          thoughts.push("Context parsing failed, using default relevance score");
+        }
+      } else {
+        thoughts.push("No context provided, using default relevance score");
+      }
+
+      // Evaluate clarity (heuristic: word count)
+      thoughts.push("Step 4: Evaluating clarity");
+      const wordCount = response.split(/\s+/).length;
+      const clarityScore = wordCount < 50 ? 0.9 : wordCount < 150 ? 0.7 : wordCount < 300 ? 0.5 : 0.3;
+      thoughts.push(`Clarity score: ${clarityScore.toFixed(2)} (based on ${wordCount} words)`);
+
+      // Check for errors or negative indicators
+      thoughts.push("Step 5: Checking for errors or issues");
+      let errorScore = 1.0;
+      if (response.toLowerCase().includes("error") || response.toLowerCase().includes("failed") || response.toLowerCase().includes("not available")) {
+        errorScore = 0.2;
+        thoughts.push("Response contains error indicators, reducing score");
+      } else {
+        thoughts.push("No error indicators found");
+      }
+
+      // Combine scores
+      thoughts.push("Step 6: Combining evaluation scores");
+      const overallScore = (relevanceScore * 0.4 + clarityScore * 0.4 + errorScore * 0.2);
+      thoughts.push(`Overall score: ${overallScore.toFixed(2)} (Relevance: ${relevanceScore.toFixed(2)}, Clarity: ${clarityScore.toFixed(2)}, Error-free: ${errorScore.toFixed(2)})`);
+
+      // AI-driven decision: refine or re-route
+      thoughts.push("Step 7: Deciding action based on score");
+      if (overallScore < 0.5) {
+        thoughts.push("Score too low, evaluating refinement vs. re-routing");
+        // Check context for clues on better tools
+        let suggestedTool = null;
+        if (contextData.length > 0) {
+          const recentChats = contextData.slice(-3);
+          const contextText = recentChats.map(c => c.content.toLowerCase()).join(' ');
+          const toolSuggestions = [
+            { tool: "calculator.calculate", keywords: ["math", "calculate"], score: 0 },
+            { tool: "translator.translate", keywords: ["translate", "language"], score: 0 },
+            { tool: "fetchapi.fetch_get", keywords: ["fetch", "http"], score: 0 }
+          ];
+          for (const suggestion of toolSuggestions) {
+            suggestion.score = suggestion.keywords.reduce((sum, k) => sum + (contextText.includes(k) ? 1 : 0), 0);
+          }
+          const topSuggestion = toolSuggestions.sort((a, b) => b.score - a.score)[0];
+          if (topSuggestion.score > 0) {
+            suggestedTool = topSuggestion.tool;
+            thoughts.push(`Suggesting re-route to ${suggestedTool} based on context`);
+          }
+        }
+
+        if (suggestedTool) {
+          thoughts.push(`Re-routing to ${suggestedTool}`);
+          return {
+            content: [{ type: "text", text: response }],
+            metadata: { reRoute: suggestedTool }
+          };
+        }
+
+        thoughts.push("No strong re-route candidate, refining response");
+        const refined = await server.callTool("refine_response", {
+          response,
+          context,
+          sessionId,
+          prompt: `As the Quality Assessor, refine the response: "${response}" to improve clarity, relevance, and correctness.`
+        });
+        return { content: [{ type: "text", text: refined.content[0].text }] };
+      }
+
+      thoughts.push("Score acceptable, returning original response");
+      console.log(`Evaluator thoughts: ${thoughts.join(' -> ')}`);
+      return { content: [{ type: "text", text: response }] };
+    } catch (error) {
+      console.error(`Evaluator error: ${error.message}`);
+      thoughts.push(`Error occurred: ${error.message}`);
+      console.log(`Evaluator thoughts: ${thoughts.join(' -> ')}`);
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// **Tool: refine_response** - Suggest improvements or rephrase a response
+server.tool(
+  "refine_response",
+  {
+    response: z.string().describe("The response to refine"),
+    context: z.string().optional().describe("Conversation history for context"),
+    sessionId: z.string().describe("The session ID for the refinement"),
+    prompt: z.string().optional().describe("Prompt guiding the refinement")
+  },
+  async ({ response, context, sessionId, prompt }) => {
+    try {
+      // Internal thought process
+      const thoughts = [];
+      thoughts.push(`Received response for refinement: "${response}"`);
+      thoughts.push(`Session ID: ${sessionId}`);
+      thoughts.push(`Prompt: "${prompt || 'No prompt provided'}"`);
+      thoughts.push("Step 1: Interpreting prompt and response");
+
+      // Use prompt to guide refinement
+      const taskDescription = prompt ? prompt : `Refine the response: "${response}" for better clarity and relevance`;
+      thoughts.push(`Refinement description: ${taskDescription}`);
+
+      // Analyze response for issues
+      thoughts.push("Step 2: Assessing response for improvement areas");
+      let refinedResponse = response;
+      if (response.length > 500) {
+        thoughts.push("Response is long (>500 chars), summarizing to improve clarity");
+        refinedResponse = response.substring(0, 200) + "... (summarized for clarity)";
+      } else if (response.toLowerCase().includes("error") || response.toLowerCase().includes("failed") || response.toLowerCase().includes("not available")) {
+        thoughts.push("Response contains error indicators, softening language");
+        refinedResponse = `It looks like there was an issue. Here's a clearer version: ${response.replace(/error|failed|not available/gi, 'challenge')}`;
+      } else {
+        thoughts.push("No major issues detected, considering context for enhancement");
+      }
+
+      // Use context to tailor refinement
+      if (context) {
+        thoughts.push("Step 3: Using context to tailor refinement");
+        try {
+          const parsedContext = JSON.parse(context);
+          const lastChat = parsedContext[parsedContext.length - 1];
+          if (lastChat && lastChat.content.includes("explain simply")) {
+            thoughts.push("Context requests simple explanation, simplifying response");
+            refinedResponse = `In simple terms: ${refinedResponse}`;
+          } else if (lastChat && lastChat.content.includes("be concise")) {
+            thoughts.push("Context requests concise response, trimming unnecessary details");
+            refinedResponse = refinedResponse.split('.').slice(0, 2).join('.') + '.';
+          } else if (lastChat && lastChat.content.includes("add details")) {
+            thoughts.push("Context requests more details, expanding response");
+            refinedResponse += " (Additional context: This response was refined based on your recent query.)";
+          }
+        } catch (e) {
+          thoughts.push("Context parsing failed, applying default refinement");
+        }
+      }
+
+      // Final check for clarity
+      thoughts.push("Step 4: Final clarity check");
+      const wordCount = refinedResponse.split(/\s+/).length;
+      if (wordCount > 50) {
+        thoughts.push("Refined response still wordy (>50 words), truncating further");
+        refinedResponse = refinedResponse.split(/\s+/).slice(0, 30).join(' ') + '...';
+      }
+      thoughts.push(`Refined response: "${refinedResponse}"`);
+
+      // Log thought process
+      console.log(`Evaluator thoughts: ${thoughts.join(' -> ')}`);
+
+      return { content: [{ type: "text", text: refinedResponse }] };
+    } catch (error) {
+      console.error(`Evaluator error: ${error.message}`);
+      thoughts.push(`Error occurred: ${error.message}`);
+      console.log(`Evaluator thoughts: ${thoughts.join(' -> ')}`);
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// Start the server
+server.start();
+
+=== /Users/damionrashford/chatbot-project/agents/executor.js ===
+// agents/executor.js
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+const server = new McpServer({ name: "Executor", version: "1.0.0" });
+
+// Internal client to communicate with other MCP servers
+const clients = {};
+async function setupClients() {
+  const servers = {
+    email: "../../mcp/email.js",
+    filesystem: "../../mcp/filesystem.js",
+    github: "../../mcp/github.js",
+    googlenews: "../../mcp/googlenews.js",
+    sequentialthinking: "../../mcp/sequentialthinking.js",
+    tavily: "../../mcp/tavily.js",
+    websearch: "../../mcp/websearch.js",
+    whois: "../../mcp/whois.js",
+    chatstore: "../../mcp/chatstore.js",
+    calculator: "../../mcp/calculator.js",
+    translator: "../../mcp/translator.js",
+    fetchapi: "../../mcp/fetchapi.js"
+  };
+
+  for (const [name, path] of Object.entries(servers)) {
+    try {
+      const client = new Client({ name: `${name}ExecutorClient`, version: "1.0.0" });
+      const transport = new StdioClientTransport({ command: "node", args: [path] });
+      await client.connect(transport);
+      clients[name] = client;
+      console.log(`Executor connected to ${name} agent`);
+    } catch (error) {
+      console.error(`Executor failed to connect to ${name} agent: ${error}`);
+    }
+  }
+}
+
+// Retry a task up to maxRetries times
+async function retryTask(taskFn, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await taskFn();
+    } catch (error) {
+      if (attempt === maxRetries) {
+        throw error;
+      }
+      console.warn(`Retry ${attempt}/${maxRetries} failed: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+}
+
+// **Tool: execute_task** - Execute a task by delegating to other agents
+server.tool(
+  "execute_task",
+  {
+    task: z.string().describe("The task to execute (e.g., 'calculate 2+2 and email result')"),
+    context: z.string().optional().describe("Conversation history for context"),
+    sessionId: z.string().describe("The session ID for the task"),
+    prompt: z.string().optional().describe("Prompt guiding the execution")
+  },
+  async ({ task, context, sessionId, prompt }) => {
+    try {
+      // Internal thought process
+      const thoughts = [];
+      thoughts.push(`Received task: "${task}"`);
+      thoughts.push(`Session ID: ${sessionId}`);
+      thoughts.push(`Prompt: "${prompt || 'No prompt provided'}"`);
+      thoughts.push("Step 1: Analyzing task and context");
+
+      // Use prompt to guide execution
+      const taskDescription = prompt ? prompt : `Execute the task: "${task}"`;
+      thoughts.push(`Task description: ${taskDescription}`);
+
+      // AI-driven task decomposition
+      thoughts.push("Step 2: Autonomously decomposing task");
+      const subtasks = [];
+      const lowerTask = task.toLowerCase();
+      let contextData = [];
+      let contextKeywords = [];
+      if (context) {
+        try {
+          contextData = JSON.parse(context);
+          const recentChats = contextData.slice(-3); // Last 3 messages for relevance
+          contextKeywords = recentChats
+            .map(chat => chat.content.toLowerCase().split(/\s+/).filter(w => w.length > 3))
+            .flat();
+          thoughts.push(`Context keywords: ${contextKeywords.join(', ')}`);
+        } catch (e) {
+          thoughts.push("Context parsing failed, relying on task");
+        }
+      }
+
+      // AI-driven tool selection based on task and context
+      const toolScores = [
+        { agent: "calculator", tool: "calculate", keywords: ["calculate", "math", "equation", "number"], score: 0 },
+        { agent: "translator", tool: "translate", keywords: ["translate", "language", "spanish", "french"], score: 0 },
+        { agent: "email", tool: "send_email", keywords: ["email", "send", "message"], score: 0 },
+        { agent: "filesystem", tool: "read_file", keywords: ["file", "read", "write", "directory"], score: 0 },
+        { agent: "googlenews", tool: "google_news_search", keywords: ["news", "article"], score: 0 },
+        { agent: "whois", tool: "whois_domain", keywords: ["whois", "domain"], score: 0 },
+        { agent: "chatstore", tool: "get_chats", keywords: ["history", "chat", "previous"], score: 0 },
+        { agent: "fetchapi", tool: "fetch_get", keywords: ["fetch", "http", "api", "url"], score: 0 }
+      ];
+
+      // Score tools based on task and context
+      thoughts.push("Step 3: Scoring tools for relevance");
+      for (const tool of toolScores) {
+        let taskMatches = tool.keywords.filter(k => lowerTask.includes(k)).length;
+        let contextMatches = contextKeywords.filter(k => tool.keywords.includes(k)).length;
+        tool.score = (taskMatches * 2 + contextMatches) / (tool.keywords.length + 1); // Weight task higher
+        thoughts.push(`${tool.agent}.${tool.tool}: score=${tool.score.toFixed(2)} (task=${taskMatches}, context=${contextMatches})`);
+      }
+
+      // Select top-scoring tools (threshold 0.1)
+      const selectedTools = toolScores
+        .filter(t => t.score > 0.1)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 3); // Limit to 3 to avoid overload
+      thoughts.push(`Selected tools: ${JSON.stringify(selectedTools.map(t => t.agent))}`);
+
+      // Build subtasks
+      for (const tool of selectedTools) {
+        let params = { context };
+        if (tool.agent === "calculator") params.expression = task;
+        else if (tool.agent === "translator") params = { text: task, targetLang: "es", context };
+        else if (tool.agent === "email") params = { receiver: ["example@email.com"], subject: "Task Result", body: task, context };
+        else if (tool.agent === "filesystem") params.path = "/example.txt";
+        else if (tool.agent === "googlenews") params.q = task;
+        else if (tool.agent === "whois") params.domain = "example.com";
+        else if (tool.agent === "fetchapi") params.url = task.match(/https?:\/\/[^\s]+/)?.[0] || "https://example.com";
+        subtasks.push({ ...tool, params });
+      }
+
+      if (subtasks.length === 0) {
+        thoughts.push("No high-scoring tools, defaulting to chatstore");
+        subtasks.push({ agent: "chatstore", tool: "get_chats", params: { context } });
+      }
+
+      // Determine execution strategy
+      let parallelExecution = true;
+      if (contextData.length > 0) {
+        thoughts.push("Step 4: Determining execution strategy");
+        const lastChat = contextData[contextData.length - 1];
+        if (lastChat.content.toLowerCase().includes("sequential") || subtasks.length > 1 && subtasks.some(t => t.agent === "filesystem" && t.tool === "write_file")) {
+          parallelExecution = false;
+          thoughts.push("Context or task dependencies suggest sequential execution");
+        } else {
+          thoughts.push("No dependencies detected, using parallel execution");
+        }
+      }
+
+      // Execute subtasks
+      thoughts.push("Step 5: Executing subtasks");
+      const results = [];
+      if (parallelExecution && subtasks.length > 1) {
+        thoughts.push("Executing subtasks in parallel");
+        const taskPromises = subtasks.map(subtask => 
+          retryTask(async () => {
+            if (clients[subtask.agent]) {
+              const subPrompt = `As the ${subtask.agent} agent, perform the task: "${subtask.tool}" with parameters: ${JSON.stringify(subtask.params)}.`;
+              const result = await clients[subtask.agent].callTool(subtask.tool, { ...subtask.params, prompt: subPrompt, sessionId });
+              return { agent: subtask.agent, result: result.content[0].text };
+            }
+            return { agent: subtask.agent, result: "Agent not available" };
+          })
+        );
+        const taskResults = await Promise.all(taskPromises.map(p => p.catch(e => ({ agent: "error", result: `Error: ${e.message}` }))));
+        results.push(...taskResults);
+        thoughts.push(`Parallel execution completed: ${JSON.stringify(taskResults.map(r => r.agent))}`);
+      } else {
+        thoughts.push("Executing subtasks sequentially");
+        for (const subtask of subtasks) {
+          const result = await retryTask(async () => {
+            if (clients[subtask.agent]) {
+              const subPrompt = `As the ${subtask.agent} agent, perform the task: "${subtask.tool}" with parameters: ${JSON.stringify(subtask.params)}.`;
+              const result = await clients[subtask.agent].callTool(subtask.tool, { ...subtask.params, prompt: subPrompt, sessionId });
+              return { agent: subtask.agent, result: result.content[0].text };
+            }
+            return { agent: subtask.agent, result: "Agent not available" };
+          });
+          results.push(result);
+          thoughts.push(`Executed ${subtask.agent}.${subtask.tool}: ${result.result}`);
+        }
+      }
+
+      // Combine results
+      thoughts.push("Step 6: Combining results");
+      const combinedResult = results.map(r => `${r.agent}: ${r.result}`).join('\n');
+      thoughts.push(`Final result: ${combinedResult}`);
+
+      // Log thought process
+      console.log(`Executor thoughts: ${thoughts.join(' -> ')}`);
+
+      return { content: [{ type: "text", text: combinedResult || "No tasks executed" }] };
+    } catch (error) {
+      console.error(`Executor error: ${error.message}`);
+      return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    }
+  }
+);
+
+// Initialize clients and start the server
+setupClients().then(() => {
+  server.start();
+}).catch(error => {
+  console.error('Failed to start Executor agent:', error);
+});
+
+=== /Users/damionrashford/chatbot-project/agents/orchestrator.js ===
+// agents/orchestrator.js
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+
+class Orchestrator {
+  constructor() {
+    this.clients = {};
+    this.context = []; // Store conversation history
+    // Define roles for each agent
+    this.agentRoles = {
+      email: "Email Handler - Manages sending and searching emails",
+      filesystem: "File Manager - Handles file operations and searches",
+      github: "GitHub Integrator - Manages GitHub repository interactions",
+      googlenews: "News Fetcher - Retrieves news articles",
+      sequentialthinking: "Reasoning Assistant - Processes sequential thought tasks",
+      tavily: "Web Searcher - Performs advanced web searches",
+      websearch: "Basic Searcher - Conducts simple web searches",
+      whois: "Domain Lookup - Performs WHOIS lookups",
+      chatstore: "Context Manager - Stores and retrieves chat history and settings",
+      calculator: "Math Solver - Handles calculations and equations",
+      translator: "Language Expert - Translates and detects languages",
+      fetchapi: "Web Client - Performs HTTP requests using Fetch API",
+      executor: "Task Coordinator - Delegates tasks to other agents",
+      evaluator: "Quality Assessor - Evaluates and refines agent responses"
+    };
+  }
+
+  // Set up connections to all MCP servers
+  async setupClients() {
+    const servers = {
+      email: "../../mcp/email.js",
+      filesystem: "../../mcp/filesystem.js",
+      github: "../../mcp/github.js",
+      googlenews: "../../mcp/googlenews.js",
+      sequentialthinking: "../../mcp/sequentialthinking.js",
+      tavily: "../../mcp/tavily.js",
+      websearch: "../../mcp/websearch.js",
+      whois: "../../mcp/whois.js",
+      chatstore: "../../mcp/chatstore.js",
+      calculator: "../../mcp/calculator.js",
+      translator: "../../mcp/translator.js",
+      fetchapi: "../../mcp/fetchapi.js",
+      executor: "./executor.js",
+      evaluator: "./evaluator.js"
+    };
+
+    for (const [name, path] of Object.entries(servers)) {
+      try {
+        const client = new Client({ name: `${name}Client`, version: "1.0.0" });
+        const transport = new StdioClientTransport({ command: "node", args: [path] });
+        await client.connect(transport);
+        this.clients[name] = client;
+        console.log(`Connected to ${name} agent`);
+      } catch (error) {
+        console.error(`Failed to connect to ${name} agent: ${error}`);
+      }
+    }
+  }
+
+  // Generate a prompt for an agent based on its role and task
+  generatePrompt(agent, task, context) {
+    const role = this.agentRoles[agent] || "Unknown Agent";
+    return `You are the ${role}. Your task is: "${task}". Use the following conversation history for context: ${context || "No context available"}. Provide a clear, concise response that aligns with your role and contributes to a unified answer. Analyze the context to autonomously select appropriate tools if needed.`;
+  }
+
+  // Handle user messages and route to appropriate agents
+  async handleMessage(message, callback) {
+    this.context.push({ user: message });
+    let result;
+
+    try {
+      // Fetch context from chatstore
+      const chatHistory = await this.clients.chatstore.callTool("get_chats", {});
+      const context = chatHistory.content[0].text;
+
+      // Route through executor with a prompt
+      const executorPrompt = this.generatePrompt("executor", message, context);
+      result = await this.clients.executor.callTool("execute_task", { task: message, context, prompt: executorPrompt });
+
+      // Evaluate the result with a prompt
+      const evaluatorPrompt = this.generatePrompt("evaluator", `Evaluate and refine the response: "${result.content[0].text}"`, context);
+      const evaluation = await this.clients.evaluator.callTool("evaluate_response", {
+        response: result.content[0].text,
+        context,
+        prompt: evaluatorPrompt
+      });
+      const finalResponse = evaluation.content[0].text;
+
+      // Append to context and notify main thread
+      this.context.push({ bot: finalResponse });
+      if (this.context.length > 10) this.context.shift(); // Limit context size
+      callback(finalResponse); // Send response to UI
+
+      return finalResponse;
+    } catch (error) {
+      console.error(`Error processing message: ${error}`);
+      const errorResponse = `Oops, something went wrong: ${error.message}`;
+      callback(errorResponse);
+      return errorResponse;
+    }
+  }
+}
+
+export default Orchestrator;
